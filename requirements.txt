@@ -1,0 +1,3 @@
+# MIT editor, pinned to the reviewed and tested source revision.
+# Installed with --no-deps: requirements.lock carries its dependencies.
+ios-homescreen @ git+https://github.com/YakupEmreYerli/ios-homescreen.git@97649547dbc44295e451c6bf130a87404481e10c

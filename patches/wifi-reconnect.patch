@@ -1,0 +1,63 @@
+Rejig: reopen the Wi-Fi tunnel for the same iPhone when a read fails after a layout write.
+Applies to ios_homescreen/device.py from https://github.com/YakupEmreYerli/ios-homescreen
+at commit 97649547dbc44295e451c6bf130a87404481e10c. ios-homescreen is MIT-licensed,
+Copyright (c) 2026 Yakup Emre Yerli (full notice in THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+--- a/ios_homescreen/device.py
++++ b/ios_homescreen/device.py
+@@ -7,6 +7,7 @@
+ 
+ import asyncio
+ import contextlib
++from dataclasses import replace
+ from collections.abc import Awaitable, Callable, Iterable, Mapping
+ from typing import Any
+ 
+@@ -118,6 +119,7 @@
+         self.read_timeout = read_timeout
+         self.send_timeout = send_timeout
+         self.reply_timeout = reply_timeout
++        self._reconnect: Callable[[], Awaitable[Device]] | None = None
+ 
+     @property
+     def info(self) -> dict[str, Any]:
+@@ -147,6 +149,22 @@
+             raise DeviceError(f"{what} failed: {exc}") from exc
+ 
+     async def _read(self, format_version: str) -> Any:
++        try:
++            return await self._read_once(format_version)
++        except DeviceError:
++            if self._reconnect is None:
++                raise
++            expected_udid = self.info["udid"]
++            await self.close()
++            fresh = await self._reconnect()
++            if not expected_udid or fresh.info["udid"] != expected_udid:
++                await fresh.close()
++                raise DeviceError("reconnected to a different iPhone", code="device_changed")
++            self.lockdown, self._close = fresh.lockdown, fresh._close
++            self.marketing_name = fresh.marketing_name
++            return await self._read_once(format_version)
++
++    async def _read_once(self, format_version: str) -> Any:
+         service = self._springboard_factory(self.lockdown)
+ 
+         async def run() -> Any:
+@@ -338,6 +356,15 @@
+ ) -> Device:
+     """Connect over ``transport`` and return a :class:`Device`. Close it when done."""
+     link = await connect(transport, backend=backend, on_event=on_event)
+-    return Device(
++    device = Device(
+         link.provider, close=link.close, transport=link.kind, marketing_name=link.marketing_name
+     )
++    if transport.wifi and device.info["udid"]:
++        pinned = replace(transport, udid=device.info["udid"])
++
++        async def reconnect() -> Device:
++            # A Home Screen write can drop the whole Wi-Fi tunnel, not just its service.
++            return await open_device(pinned, on_event=on_event, backend=backend)
++
++        device._reconnect = reconnect
++    return device
