@@ -239,9 +239,11 @@ answer to a write, restores and recovery after a restart.
 - Macs: Apple silicon on macOS 26.
 - iPhone: an iPhone 16 Pro on iOS 27.0.1, over USB and Wi-Fi: layout reads, writes with
   readback, and a backup restore.
-- AI clients: Claude Code 2.1.316 and Codex CLI 0.166.0 (TUI and `--yolo`) on Demo, and
-  an MCP write and restore on that iPhone over Wi-Fi, approved in Rejig's window. Claude
-  Desktop: the setup above is written but not tested yet.
+- AI clients on Demo: Claude Code 2.1.316 (approve, decline and cancel in the chat form);
+  Codex CLI 0.149.0's TUI (an apply and a restore, approved in Rejig's window); Codex CLI
+  0.166.0's TUI and `--yolo` (sent to Rejig's window; closing it wrote nothing). On that
+  iPhone over Wi-Fi: an MCP write and restore, approved in Rejig's window. Claude Desktop:
+  the setup above is written but not tested yet.
 
 That is one phone. Apple can change the private Home Screen service in any iOS release,
 so try Demo first and keep the backup Rejig makes. Intel Macs, Windows and Linux are not
