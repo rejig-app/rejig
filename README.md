@@ -45,33 +45,61 @@ USB works too, and **Demo** mode lets you try everything on a pretend phone.
    cd rejig
    ```
 
-2. Build the app (a few seconds):
-
-   ```bash
-   bash scripts/build.sh
-   ```
-
-3. Install the app and its Python runtime (a few minutes, mostly downloads):
+2. Build and install the app and its Python runtime (a few minutes, mostly downloads):
 
    ```bash
    bash scripts/install.sh
    ```
 
-   This puts the app in `~/Applications/Rejig.app` and its runtime in
-   `~/Library/Application Support/Rejig/.venv`. Dependencies are installed at the exact
-   versions, with hash checks, listed in `requirements.lock`.
+   This builds `build/Rejig.app`, puts the app in `~/Applications/Rejig.app` and its
+   runtime in `~/Library/Application Support/Rejig/.venv`. Dependencies are installed at
+   the exact versions, with hash checks, listed in `requirements.lock`.
 
-4. Open it:
+3. Open it:
 
    ```bash
    open ~/Applications/Rejig.app
    ```
 
-5. Choose **Demo** in the top bar to try it without a phone.
+4. Choose **Demo** in the top bar to try it without a phone.
 
 The app is built and signed ad hoc on your own Mac; it is not notarized. It needs both
 the app and the runtime folder. If a Homebrew upgrade removes Python 3.13, run
 `bash scripts/install.sh` again.
+
+## Update
+
+Quit Rejig, then from the `rejig` folder:
+
+```bash
+git pull
+bash scripts/install.sh
+```
+
+The installer rebuilds the app and reinstalls the engine with the current patches. Your
+layouts, backups and Wi-Fi pairing stay where they are.
+
+## Uninstall
+
+Quit Rejig. Removing it does not change anything on your iPhone.
+
+1. Remove the app and its runtime. This keeps your layouts and backups:
+
+   ```bash
+   rm -rf ~/Applications/Rejig.app "$HOME/Library/Application Support/Rejig/.venv"
+   ```
+
+2. To also delete your saved layouts, backups, icon cache and logs, remove the rest of
+   `~/Library/Application Support/Rejig`. The backups there are the only way to go back
+   to an earlier layout: copy the `.plist` files in `data/backups/` somewhere else first
+   if you want to keep them.
+3. The Wi-Fi pairing is the phone's `remote_<UDID>.plist` file in pymobiledevice3's
+   folder (see [Your data](#your-data)). Other pymobiledevice3 tools use that folder too;
+   delete only that file if you no longer want this Mac paired.
+4. Optional: the iPhone keeps trusting this Mac until you reset that on the phone:
+   **Settings > General > Transfer or Reset iPhone > Reset > Reset Location & Privacy**.
+   This resets trust for every computer and also resets location and privacy settings
+   for your apps. Removing Rejig does not require it.
 
 ## Connect your iPhone
 

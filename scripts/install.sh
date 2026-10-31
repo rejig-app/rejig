@@ -15,18 +15,16 @@ fi
 python="$runtime_dir/.venv/bin/python3"
 # Upstream's tested dependency set, hash-checked; then the engine itself at its pinned commit.
 "$python" -m pip install --require-hashes -r "$project_dir/requirements.lock"
-"$python" -m pip install --no-deps -r "$project_dir/requirements.txt"
+# --force-reinstall: start from the unpatched engine every run, so an update whose patches
+# changed applies cleanly instead of meeting the previous run's patched files.
+"$python" -m pip install --no-deps --force-reinstall -r "$project_dir/requirements.txt"
 engine_dir="$("$python" -c 'import pathlib, ios_homescreen; print(pathlib.Path(ios_homescreen.__file__).parent.parent)')"
 for engine_patch in "$project_dir"/patches/*.patch; do
-    # --force: never guess "reversed", so this succeeds only when the patch is already applied.
-    if ! /usr/bin/patch --dry-run --reverse --force --silent -p1 -d "$engine_dir" < "$engine_patch" >/dev/null 2>&1; then
-        # Patches sharing a file apply at an offset; keep no .orig copy in site-packages.
-        /usr/bin/patch --batch --forward --no-backup-if-mismatch -p1 -d "$engine_dir" < "$engine_patch"
-    fi
+    # Patches sharing a file apply at an offset; keep no .orig copy in site-packages.
+    /usr/bin/patch --batch --forward --no-backup-if-mismatch -p1 -d "$engine_dir" < "$engine_patch"
 done
-if [[ ! -d "$app" ]]; then
-    bash "$project_dir/scripts/build.sh"
-fi
+# Always rebuild, so an update never installs an app built from older source.
+bash "$project_dir/scripts/build.sh"
 mkdir -p "$HOME/Applications"
 rm -rf "$HOME/Applications/Rejig.app"
 ditto "$app" "$HOME/Applications/Rejig.app"
