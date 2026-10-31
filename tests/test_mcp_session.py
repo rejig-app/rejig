@@ -7,6 +7,7 @@ approval window is a small fake script; nothing here touches a real phone or the
 """
 
 import asyncio
+import base64
 import contextlib
 import io
 import json
@@ -184,6 +185,21 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
         for result in results:
             self.assertEqual(json.loads(result.content[1].text), data(result), result.content[0].text)
         self.assertTrue(data(results[0])["pages"], "read_layout shows pages")
+
+    async def test_demo_icons_arrive_as_png_images(self):
+        # Demo's icons are SVG, which models cannot see; the server sends them as PNG.
+        async with self.client() as client:
+            await client.call_tool("read_layout", {})
+            apps = data(await client.call_tool("list_apps", {}))["apps"][:2]
+            ids = [app["id"] for app in apps]
+            result = await client.call_tool("get_app_icons", {"ids": ids})
+        self.assertFalse(result.is_error, result.content)
+        self.assertEqual(data(result)["returned"], ids)
+        images = [block for block in result.content if block.type == "image"]
+        self.assertEqual(len(images), 2)
+        for image in images:
+            self.assertEqual(image.mime_type, "image/png")
+            self.assertTrue(base64.b64decode(image.data).startswith(b"\x89PNG\r\n\x1a\n"))
 
     # ------------------------------------------------------------------ approval
 

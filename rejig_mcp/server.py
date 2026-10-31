@@ -15,6 +15,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -728,6 +729,27 @@ async def list_apps(query: str | None = None, section: Literal["home", "library"
     return ok(f"{len(wanted)} apps ({library_only} App Library-only on the phone).", data)
 
 
+def bitmap(data: bytes, kind: str) -> tuple[bytes, str] | None:
+    """A PNG or JPEG icon as is; an SVG one (Demo's) as PNG through macOS's sips, since models
+    see only bitmaps. Anything else, or a failed conversion, is None."""
+    kind = kind.split(";")[0].strip()
+    if kind in ("image/png", "image/jpeg"):
+        return data, kind
+    if kind != "image/svg+xml":
+        return None
+    with tempfile.TemporaryDirectory() as folder:
+        svg, png = Path(folder, "icon.svg"), Path(folder, "icon.png")
+        svg.write_bytes(data)
+        try:
+            done = subprocess.run(
+                ["/usr/bin/sips", "-s", "format", "png", str(svg), "--out", str(png)],
+                capture_output=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (png.read_bytes(), "image/png") if done.returncode == 0 and png.is_file() else None
+
+
 @server.tool(annotations=READ_ONLY)
 @guarded
 async def get_app_icons(ids: list[str]) -> Annotated[CallToolResult, Icons]:
@@ -741,12 +763,13 @@ async def get_app_icons(ids: list[str]) -> Annotated[CallToolResult, Icons]:
     returned, missing = [], []
     for ident in dict.fromkeys(ids):
         found = await call(editor.request, "GET", f"/api/icons/{ident}", raw=True) if ident.isprintable() else None
-        if not found or not found[1].startswith(("image/png", "image/jpeg")):
+        image = await call(bitmap, *found) if found else None
+        if not image:
             missing.append(ident)
             continue
-        data, kind = found
+        data, kind = image
         blocks.append(TextContent(type="text", text=f"{names.get(ident, ident)} ({ident})"))
-        blocks.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mime_type=kind.split(";")[0]))
+        blocks.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mime_type=kind))
         returned.append(ident)
     pending = bool((state.get("icons") or {}).get("pending"))
     return ok(
