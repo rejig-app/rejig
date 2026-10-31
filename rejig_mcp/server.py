@@ -195,16 +195,21 @@ class Failure(Exception):
 # ---------------------------------------------------------------------- helpers
 
 
+def as_json(data: dict[str, Any]) -> TextContent:
+    """The structured result as text too: Claude Desktop hands the model only text content."""
+    return TextContent(type="text", text=json.dumps(data, ensure_ascii=False, default=str))
+
+
 def ok(text: str, data: dict[str, Any], extra: list[Any] | None = None) -> CallToolResult:
     return CallToolResult(
-        content=[TextContent(type="text", text=text), *(extra or [])], structured_content=data
+        content=[TextContent(type="text", text=text), as_json(data), *(extra or [])], structured_content=data
     )
 
 
 def fail(code: str, message: str, **extra: Any) -> CallToolResult:
     error = {"code": code, "message": message, **extra}
     return CallToolResult(
-        content=[TextContent(type="text", text=f"{code}: {message}")],
+        content=[TextContent(type="text", text=f"{code}: {message}"), as_json({"error": error})],
         structured_content={"error": error},
         is_error=True,
     )

@@ -168,6 +168,20 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data(status)["device"]["id"], server.device_id(udid))
         self.assertEqual(data(apps)["library_only_count"], len(data(layout)["library"]))
 
+    async def test_text_content_carries_the_structured_result(self):
+        # Clients that pass only text to the model (Claude Desktop) must still see ids and pages.
+        async with self.client() as client:
+            results = [
+                await client.call_tool("read_layout", {}),
+                await client.call_tool("get_status", {}),
+                await client.call_tool("list_apps", {}),
+                await client.call_tool("apply_plan", {"plan_id": "0" * 64}),
+            ]
+        self.assertTrue(results[-1].is_error)
+        for result in results:
+            self.assertEqual(json.loads(result.content[1].text), data(result), result.content[0].text)
+        self.assertTrue(data(results[0])["pages"], "read_layout shows pages")
+
     # ------------------------------------------------------------------ approval
 
     async def test_approved_plan_is_written_and_read_back(self):
