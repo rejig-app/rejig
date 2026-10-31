@@ -1,0 +1,97 @@
+Rejig: write a backup or an edited layout only to the iPhone it came from.
+Applies to ios_homescreen/ui/session.py and ui/errors.py from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c. The editor loads a backup with load_backup, which
+drops the recorded device, then opens whichever phone is connected; Apply checks only the
+layout fingerprint. Both now compare the recorded UDID with the opened phone before writing.
+ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup Emre Yerli (full notice in
+THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+--- a/ios_homescreen/ui/errors.py
++++ b/ios_homescreen/ui/errors.py
+@@ -73,6 +73,14 @@
+     "no_pair_record": ("This computer is not paired with the iPhone for Wi-Fi", _WIFI_SETUP),
+     "stale_pair_record": ("The Wi-Fi pairing needs to be made again", _WIFI_SETUP),
+     "not_advertising": ("The iPhone did not answer on the network", _WIFI_STEPS),
++    "other_device": (
++        "This iPhone does not match",
++        [
++            "Nothing was written.",
++            "Connect the iPhone this backup or layout came from, then try again.",
++            "To change this iPhone, read it first and edit that layout.",
++        ],
++    ),
+     "several_devices": (
+         "More than one iPhone answered",
+         ["Restart the editor with `--udid UDID` to pick one."],
+--- a/ios_homescreen/ui/session.py
++++ b/ios_homescreen/ui/session.py
+@@ -29,6 +29,7 @@
+ from ..model import describe, describe_changes, match_folders, to_document
+ from ..paths import cache_dir
+ from ..planner import LayoutError, Plan, load_layout, plan_layout
++from ..snapshots import device_of
+ from ..state import (
+     PAGE_CELLS,
+     StateError,
+@@ -509,9 +510,12 @@
+         plan, issues = self.plan(layout, remove)
+         if plan is None:
+             raise LayoutProblems(issues)
++        assert self.read is not None
++        # Rejig: an edited layout belongs to the phone it was read from.
++        udid = (self.read.get("device") or {}).get("udid")
+ 
+         async def work(job: Job) -> dict[str, Any]:
+-            return await self._write_job(job, "apply", plan.payload, force=force)
++            return await self._write_job(job, "apply", plan.payload, force=force, udid=udid)
+ 
+         return self._start("apply", work)
+ 
+@@ -523,20 +527,44 @@
+         self._refuse_in_showcase()
+         path = self.backup_path(name)
+         target = api.load_backup(path)
++        # Rejig: load_backup drops the device; the backup belongs to the phone it records.
++        udid = device_of(path).get("udid")
+ 
+         async def work(job: Job) -> dict[str, Any]:
+-            return await self._write_job(job, "restore", target)
++            return await self._write_job(job, "restore", target, udid=udid)
+ 
+         return self._start("restore", work)
+ 
+     async def _write_job(
+-        self, job: Job, kind: str, target: dict[str, Any], *, force: bool = False
++        self,
++        job: Job,
++        kind: str,
++        target: dict[str, Any],
++        *,
++        force: bool = False,
++        udid: str | None = None,
+     ) -> dict[str, Any]:
+         self._refuse_in_showcase()
+         await self._release_icons()
+         device = await self._connect(job.emit)
+         handed_over = False
+         try:
++            # Rejig: refuse before any write when the opened phone is not the one the
++            # backup or layout came from, or either identity is unknown. Apply's force
++            # (overwrite edits made on the phone since the read) does not skip this.
++            actual = str(device.info.get("udid") or "")
++            source = "backup" if kind == "restore" else "layout"
++            if not udid or not actual:
++                raise api.DeviceError(
++                    f"Rejig could not confirm this iPhone is the one the {source} came from, "
++                    "so nothing was written.",
++                    code="other_device",
++                )
++            if actual != udid:
++                raise api.DeviceError(
++                    f"This {source} came from a different iPhone, so nothing was written.",
++                    code="other_device",
++                )
+             common = {
+                 "backup_dir": self.settings.backup_dir,
+                 "timing": self.settings.timing,

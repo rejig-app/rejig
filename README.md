@@ -24,6 +24,8 @@ USB works too, and **Demo** mode lets you try everything on a pretend phone.
   what was written. If that check fails, it writes the backup back and checks again.
 - Restores an earlier backup (**Backups**) after a confirmation that shows its date and
   item counts, then reads the phone back to check it. A restore does not list every item.
+- Writes a backup or an edited layout only to the iPhone it came from. A different iPhone,
+  or one whose identity is unknown, gets nothing.
 - Imports and exports layouts as files.
 
 ## Requirements
@@ -123,8 +125,9 @@ The smoke test opens the real window on a pretend phone, adds and undoes a page,
 icons, opens the Apply preview, applies, checks the backup and readback, and restores the
 backup. It never contacts a real phone. It saves `demo-preview.png` in the app's data folder.
 
-The unit tests cover the Wi-Fi pairing proof format and the Wi-Fi reconnect patch
-(recovery, same-phone check, USB failure, cancellation).
+The unit tests cover the Wi-Fi pairing proof format, the Wi-Fi reconnect patch
+(recovery, same-phone check, USB failure, cancellation) and the device identity patch
+(Restore and Apply refuse another iPhone and still write to the right one).
 
 ## Tested on
 
@@ -138,8 +141,10 @@ supported.
 
 ## Limits
 
-- The installer applies `patches/wifi-reconnect.patch` to the engine: a layout write can
-  close the Wi-Fi tunnel, and the patch reopens it for the same phone only.
+- The installer applies two patches to the engine. `patches/wifi-reconnect.patch`: a
+  layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
+  only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
+  is the one the backup or layout came from before writing.
 - Apps that were offloaded may show up after a write even though the phone did not list
   them before. Read the phone again and check the layout before you rely on it.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
@@ -148,8 +153,8 @@ supported.
 
 ## Credits
 
-Rejig is by keyclipse. The Mac window, connection controls, installer and the Wi-Fi
-reconnect patch are Rejig's own work, under the MIT license.
+Rejig is by keyclipse. The Mac window, connection controls, installer and the two engine
+patches are Rejig's own work, under the MIT license.
 
 Reading and writing the layout, the editor you see in the window and Demo mode come from
 [ios-homescreen](https://github.com/YakupEmreYerli/ios-homescreen) by Yakup Emre Yerli

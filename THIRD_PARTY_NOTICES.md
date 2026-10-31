@@ -20,8 +20,10 @@ dependencies from their publishers; each comes under its own license.
 
 ## Modified upstream code
 
-`patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py` and contains lines
-from it. The installer applies it to the user's own copy. ios-homescreen's license:
+`patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py`, and
+`patches/device-identity.patch` modifies `ios_homescreen/ui/session.py` and
+`ios_homescreen/ui/errors.py`. Both contain lines from those files. The installer applies
+them to the user's own copy. ios-homescreen's license:
 
 ```text
 MIT License

@@ -17,11 +17,12 @@ python="$runtime_dir/.venv/bin/python3"
 "$python" -m pip install --require-hashes -r "$project_dir/requirements.lock"
 "$python" -m pip install --no-deps -r "$project_dir/requirements.txt"
 engine_dir="$("$python" -c 'import pathlib, ios_homescreen; print(pathlib.Path(ios_homescreen.__file__).parent.parent)')"
-reconnect_patch="$project_dir/patches/wifi-reconnect.patch"
-# --force: never guess "reversed", so this succeeds only when the patch is already applied.
-if ! /usr/bin/patch --dry-run --reverse --force --silent -p1 -d "$engine_dir" < "$reconnect_patch" >/dev/null 2>&1; then
-    /usr/bin/patch --batch --forward -p1 -d "$engine_dir" < "$reconnect_patch"
-fi
+for engine_patch in "$project_dir"/patches/*.patch; do
+    # --force: never guess "reversed", so this succeeds only when the patch is already applied.
+    if ! /usr/bin/patch --dry-run --reverse --force --silent -p1 -d "$engine_dir" < "$engine_patch" >/dev/null 2>&1; then
+        /usr/bin/patch --batch --forward -p1 -d "$engine_dir" < "$engine_patch"
+    fi
+done
 if [[ ! -d "$app" ]]; then
     bash "$project_dir/scripts/build.sh"
 fi
