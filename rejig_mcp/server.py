@@ -737,17 +737,17 @@ def bitmap(data: bytes, kind: str) -> tuple[bytes, str] | None:
         return data, kind
     if kind != "image/svg+xml":
         return None
-    with tempfile.TemporaryDirectory() as folder:
-        svg, png = Path(folder, "icon.svg"), Path(folder, "icon.png")
-        svg.write_bytes(data)
-        try:
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            svg, png = Path(folder, "icon.svg"), Path(folder, "icon.png")
+            svg.write_bytes(data)
             done = subprocess.run(
                 ["/usr/bin/sips", "-s", "format", "png", str(svg), "--out", str(png)],
                 capture_output=True, timeout=10, check=False,
             )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return (png.read_bytes(), "image/png") if done.returncode == 0 and png.is_file() else None
+            return (png.read_bytes(), "image/png") if done.returncode == 0 and png.is_file() else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 @server.tool(annotations=READ_ONLY)

@@ -201,6 +201,16 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image.mime_type, "image/png")
             self.assertTrue(base64.b64decode(image.data).startswith(b"\x89PNG\r\n\x1a\n"))
 
+    async def test_icon_conversion_failure_lists_the_icon_as_missing(self):
+        async with self.client() as client:
+            await client.call_tool("read_layout", {})
+            ids = [app["id"] for app in data(await client.call_tool("list_apps", {}))["apps"][:2]]
+            with mock.patch.object(server.tempfile, "TemporaryDirectory", side_effect=OSError("disk full")):
+                result = await client.call_tool("get_app_icons", {"ids": ids})
+        self.assertFalse(result.is_error, result.content)
+        self.assertEqual(data(result)["returned"], [])
+        self.assertEqual(data(result)["missing"], ids)
+
     # ------------------------------------------------------------------ approval
 
     async def test_approved_plan_is_written_and_read_back(self):

@@ -263,6 +263,9 @@ supported.
 - The MCP server arranges the layout only. It does not uninstall apps, create widgets or
   read Screen Time; give it usage numbers yourself if you want it to sort by them.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
+- Demo's app icons are SVG, so the MCP server converts them to PNG with macOS's `sips`
+  before sending them to an AI client. That was checked on macOS 26 only; where the
+  conversion fails, those icons come back listed as missing.
 - `srptools` stays at 1.0.1: version 2 reads pymobiledevice3's hex-encoded pairing proof
   as raw bytes and Wi-Fi pairing fails. Proof checking stays on.
 
