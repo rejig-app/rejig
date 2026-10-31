@@ -244,8 +244,12 @@ answer to a write, restores and recovery after a restart.
   (an apply and a restore, approved in Rejig's window); Codex CLI 0.166.0's TUI and
   `--yolo` (sent to Rejig's window; closing it wrote nothing). On that iPhone over Wi-Fi
   and over USB: an MCP write and restore, approved in Rejig's window.
+- iPhone: also an iPhone Duo (iPhone19,4) on iOS 27.2, over USB: layout reads and two MCP
+  writes with readback, approved in Rejig's window. Folded and unfolded, SpringBoard
+  reports the same 4 x 6 grid and 4-item dock, and the layout reads back the same. Until
+  the engine pin includes the model name, Rejig shows it as `iPhone19,4`.
 
-That is one phone. Apple can change the private Home Screen service in any iOS release,
+That is two phones. Apple can change the private Home Screen service in any iOS release,
 so try Demo first and keep the backup Rejig makes. Intel Macs, Windows and Linux are not
 supported.
 
