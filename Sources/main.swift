@@ -102,6 +102,9 @@ final class Approval: NSObject, NSWindowDelegate {
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         panel.title = "Rejig: approve a Home Screen change"
         panel.level = .floating
+        // NSPanel hides while its app is inactive, and macOS may refuse activate() below when another
+        // app (Claude Desktop) is in front: the window then never shows.
+        panel.hidesOnDeactivate = false
         panel.delegate = self
         panel.isReleasedWhenClosed = false
         let heading = NSTextField(wrappingLabelWithString: title)

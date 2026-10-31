@@ -197,7 +197,7 @@ class Failure(Exception):
 
 def as_json(data: dict[str, Any]) -> TextContent:
     """The structured result as text too: Claude Desktop hands the model only text content."""
-    return TextContent(type="text", text=json.dumps(data, ensure_ascii=False, default=str))
+    return TextContent(type="text", text=json.dumps(data, ensure_ascii=False))
 
 
 def ok(text: str, data: dict[str, Any], extra: list[Any] | None = None) -> CallToolResult:
@@ -427,7 +427,16 @@ def approval_text(state: dict[str, Any], lines: list[str], plan_id: str) -> str:
     return f"Write these {len(lines)} changes to {name}? A backup is saved first. (Plan {plan_id[:12]})"
 
 
+def public(record: dict[str, Any]) -> dict[str, Any]:
+    """A journal record as the model sees it: an error's code, title and steps, never its raw detail."""
+    reread = record.get("reread_error")
+    if isinstance(reread, dict):
+        record = {**record, "reread_error": {k: reread[k] for k in ("code", "title", "steps") if k in reread}}
+    return record
+
+
 def operation(record: dict[str, Any]) -> CallToolResult:
+    record = public(record)
     data = {"operation": record}
     state = record.get("state")
     if state in {"applied", "applied_reconciled"}:
@@ -626,7 +635,7 @@ def last_operation(root: Path) -> dict[str, Any] | None:
     for path in reversed(journals):
         record = json.loads(path.read_text())
         if record.get("state") in {"submitting", "writing", "awaiting_approval", "outcome_unknown", "applied_unverified"}:
-            return record
+            return public(record)
     return None
 
 
@@ -917,7 +926,7 @@ async def get_operation(ctx: Context, plan_id: str) -> Annotated[CallToolResult,
             return operation(record)
         return operation(await finish(plan, job, record))
     if job and job.get("state") == "running" and not record.get("job_id"):  # maybe this plan's: wait
-        return ok("Rejig is busy; call get_operation again shortly.", {"operation": record})
+        return ok("Rejig is busy; call get_operation again shortly.", {"operation": public(record)})
     # The editor no longer knows the write (it restarted, or the request's answer was lost):
     # read the phone. Only a phone showing the plan counts as evidence it was written.
     state = await read_now(ctx)

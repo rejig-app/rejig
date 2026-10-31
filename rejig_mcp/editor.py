@@ -13,6 +13,7 @@ import http.cookiejar
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -133,7 +134,12 @@ class Editor:
             except ValueError:
                 found = {}
             code = found.pop("code", None) or f"http_{error.code}"
-            raise EditorError(code, str(found.pop("message", error.reason)), **found) from error
+            message = str(found.pop("message", error.reason))
+            if error.code >= 500:
+                # Raw exception text can hold paths or device details: keep it in the local log only.
+                print(f"rejig editor {error.code} {code}: {message} {found}", file=sys.stderr)
+                raise EditorError(code, (found.get("error") or {}).get("title") or "Rejig's editor hit an unexpected error.") from error
+            raise EditorError(code, message, **found) from error
         except (urllib.error.URLError, OSError) as error:
             self._session = None
             raise EditorError("app_not_running", "Rejig's editor is not answering.") from error

@@ -7,6 +7,8 @@ approval window is a small fake script; nothing here touches a real phone or the
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -17,6 +19,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -472,20 +475,26 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
             answer = real(method, path, body, **options)
             job = answer.get("job") if isinstance(answer, dict) else None
             if job and job.get("kind") == "apply" and job.get("state") == "done":
-                job["result"] = {**job["result"], "reread_error": {"code": "read_failed", "title": "No answer"}}
+                job["result"] = {**job["result"], "reread_error": {"code": "read_failed", "title": "No answer", "detail": secret}}
             return answer
 
+        secret = "/var/folders/zz/raw-trace-00008120-SECRET"  # upstream friendly() puts str(exc) in detail
         async with self.client() as client:
             plan = await self.plan(client)
             with mock.patch.object(server.editor, "request", no_read_back):
                 result = await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]})
             self.assertFalse(result.is_error, result.content)
             self.assertEqual(record_of(result)["state"], "applied_unverified")
-            self.assertEqual(record_of(result)["reread_error"]["code"], "read_failed")
+            self.assertEqual(record_of(result)["reread_error"], {"code": "read_failed", "title": "No answer"})
             repeat = await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]})
             self.assertEqual(record_of(repeat)["state"], "applied_unverified")
-            status = data(await client.call_tool("get_status", {}))
+            status_result = await client.call_tool("get_status", {})
+            status = data(status_result)
             self.assertEqual(status["last_operation"]["state"], "applied_unverified")
+            for shown in (result, repeat, status_result):
+                self.assertNotIn(secret, json.dumps(data(shown)) + str(shown.content))
+            journal = self.support / "mcp" / "operations" / f"{plan['plan_id']}.json"
+            self.assertIn(secret, journal.read_text())  # the raw detail stays in the local journal
             checked = await client.call_tool("get_operation", {"plan_id": plan["plan_id"]})
         self.assertFalse(checked.is_error, checked.content)
         self.assertEqual(record_of(checked)["state"], "applied")
@@ -493,6 +502,22 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record_of(checked)["library_check"]["ok"])
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(len(self.backups()), 1)
+
+    async def test_an_unexpected_editor_error_reaches_the_model_without_its_raw_text(self):
+        secret = "/var/folders/zz/raw-trace-00008120-SECRET"
+        body = {"code": "unexpected", "message": secret, "error": {"code": "x", "title": "Something went wrong", "detail": secret}}
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "http://127.0.0.1/api/state", 500, "Internal Server Error", {}, io.BytesIO(json.dumps(body).encode())
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(server.editor, "_login", return_value=opener), contextlib.redirect_stderr(stderr):
+            async with self.client() as client:
+                result = await client.call_tool("get_status", {})
+        self.assertTrue(result.is_error)
+        self.assertEqual(data(result)["error"], {"code": "unexpected", "message": "Something went wrong"})
+        self.assertNotIn(secret, json.dumps(data(result)) + str(result.content))
+        self.assertIn(secret, stderr.getvalue())  # kept in the client's local server log
 
     async def lost_write(self, client, plan_id, **changes):
         """A plan whose write was journalled, then lost by the editor; get_operation's answer."""
