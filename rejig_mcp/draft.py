@@ -224,7 +224,13 @@ def _operation(layout: dict[str, Any], op: Mapping[str, Any], apps: Mapping[str,
         target = _page_number(layout, op.get("to"))
         layout["pages"].insert(target, layout["pages"].pop(source))
     else:
-        raise DraftError("bad_operation", f"Unknown operation {kind!r}.")
+        raise DraftError(
+            "bad_operation",
+            f"Unknown operation {kind!r}. Each operation names itself in \"op\", e.g."
+            ' {"op": "move", "item": ID, "to": {"section": "page", "page": 1, "index": 1}};'
+            " op is one of move, send_to_library, folder_create, folder_rename, folder_dissolve,"
+            " page_add, page_remove, page_move, or undo (alone in its call).",
+        )
 
 
 def apply_operations(

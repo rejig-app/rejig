@@ -738,7 +738,8 @@ async def get_app_icons(ids: list[str]) -> Annotated[CallToolResult, Icons]:
 @server.tool(annotations=LOCAL_EDIT)
 @guarded
 async def edit_draft(draft_id: str, base_revision: int, operations: list[dict[str, Any]]) -> Annotated[CallToolResult, DraftRevision]:
-    """Edit a draft (nothing touches the phone). operations run in order, all or nothing:
+    """Edit a draft (nothing touches the phone). operations run in order, all or nothing; each
+    is one object whose "op" names it, e.g. {"op": "move", "item": ID, "to": {...}}:
     move {item, to:{section: dock|page|folder, page?, index?, folder?}} (an App Library app id
     brings it to the Home Screen; 1-based page and index; page N+1 makes a new page);
     send_to_library {items}; folder_create {name, items, to?}; folder_rename {folder, name};

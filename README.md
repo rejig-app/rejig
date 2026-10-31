@@ -204,8 +204,11 @@ and does nothing until you apply, export or discard them.
   (or `~/.pymobiledevice3/` if an older install created it). Treat these like passwords
   and don't share them.
 
-Everything stays on your Mac. The editor inside the window listens only on `127.0.0.1`,
-with a fresh session token and request checks; it is not reachable from your network.
+Rejig itself sends nothing off your Mac. The editor inside the window listens only on
+`127.0.0.1`, with a fresh session token and request checks; it is not reachable from your
+network. If you connect an AI client, what the MCP server returns (your layout, app names,
+any icons it asks for) goes to that client, and on to its model provider if the model runs
+in the cloud.
 
 Don't disconnect or force-quit while Rejig is applying or restoring. If the check and the
 rollback both fail, Rejig says so and keeps the backup: reconnect and use **Backups**.

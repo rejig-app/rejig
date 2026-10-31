@@ -127,6 +127,7 @@ class DraftEditTest(unittest.TestCase):
             ({"op": "folder_rename", "folder": "Work", "name": "x" * 41}, "bad_name"),
             ({"op": "folder_create", "name": "W", "items": ["widget-1"]}, "not_foldable"),
             ({"op": "explode"}, "bad_operation"),
+            ({"move": {"item": "widget-1", "to": {"section": "dock"}}}, "bad_operation"),
         ]
         for operation, code in cases:
             with self.subTest(code=code), self.assertRaises(DraftError) as caught:
