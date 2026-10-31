@@ -29,6 +29,8 @@ LAUNCH_WAIT = 20.0
 POLL = 0.25
 
 
+UNEXPECTED = "Rejig's editor hit an unexpected error."
+
 class EditorError(Exception):
     def __init__(self, code: str, message: str, **extra: Any) -> None:
         super().__init__(message)
@@ -138,7 +140,7 @@ class Editor:
             if error.code >= 500:
                 # Raw exception text can hold paths or device details: keep it in the local log only.
                 print(f"rejig editor {error.code} {code}: {message} {found}", file=sys.stderr)
-                raise EditorError(code, (found.get("error") or {}).get("title") or "Rejig's editor hit an unexpected error.") from error
+                raise EditorError(code, (found.get("error") or {}).get("title") or UNEXPECTED) from error
             raise EditorError(code, message, **found) from error
         except (urllib.error.URLError, OSError) as error:
             self._session = None

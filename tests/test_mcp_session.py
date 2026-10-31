@@ -503,6 +503,29 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(len(self.backups()), 1)
 
+    async def test_an_old_refused_journal_shows_no_raw_server_error(self):
+        secret = "/var/folders/zz/raw-trace-00008120-SECRET"
+        async with self.client() as client:
+            plan = await self.plan(client)
+            old = {"plan_id": plan["plan_id"], "state": "refused", "error_code": "unexpected", "message": secret}
+            plans.write_journal(self.support / "mcp", plan["plan_id"], old)  # written before 5xx text was hidden
+            result = await client.call_tool("get_operation", {"plan_id": plan["plan_id"]})
+        self.assertTrue(result.is_error)
+        self.assertEqual(data(result)["error"]["message"], server.UNEXPECTED)
+        self.assertNotIn(secret, json.dumps(data(result)) + str(result.content))
+
+    async def test_an_approval_window_that_cannot_start_shows_no_raw_os_error(self):
+        secret = "/var/folders/zz/missing-00008120-SECRET/Rejig"
+        stderr = io.StringIO()
+        with mock.patch.object(server, "approver_command", lambda: [secret, "--approve"]), contextlib.redirect_stderr(stderr):
+            async with self.client(forms=False) as client:
+                plan = await self.plan(client)
+                result = await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]})
+        self.assertEqual(data(result)["error"]["code"], "approval_unavailable")
+        self.assertNotIn(secret, json.dumps(data(result)) + str(result.content))
+        self.assertIn(secret, stderr.getvalue())
+        self.assertEqual(self.backups(), [])
+
     async def test_an_unexpected_editor_error_reaches_the_model_without_its_raw_text(self):
         secret = "/var/folders/zz/raw-trace-00008120-SECRET"
         body = {"code": "unexpected", "message": secret, "error": {"code": "x", "title": "Something went wrong", "detail": secret}}

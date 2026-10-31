@@ -14,6 +14,7 @@ import functools
 import hashlib
 import json
 import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from ios_homescreen.storage import PULLS, find_backup
 
 from . import draft as drafting
 from .draft import DraftError, Drafts
-from .editor import INSTALLED_APP, EditorError, Editor
+from .editor import INSTALLED_APP, UNEXPECTED, EditorError, Editor
 from .optimize import optimize
 from .plans import (
     ATTEMPTED,
@@ -432,6 +433,9 @@ def public(record: dict[str, Any]) -> dict[str, Any]:
     reread = record.get("reread_error")
     if isinstance(reread, dict):
         record = {**record, "reread_error": {k: reread[k] for k in ("code", "title", "steps") if k in reread}}
+    code = str(record.get("error_code") or "")
+    if record.get("state") == "refused" and (code == "unexpected" or code.startswith("http_5")):
+        record = {**record, "message": UNEXPECTED}  # journals from before the editor hid raw 5xx text
     return record
 
 
@@ -472,7 +476,10 @@ async def mac_approval(plan_id: str, title: str, lines: list[str], ctx: Context,
         try:
             child = subprocess.Popen(approver_command(), stdin=subprocess.PIPE)
         except OSError as error:
-            raise Failure("approval_unavailable", f"Cannot open Rejig's approval window: {error}") from error
+            print(f"rejig approval window failed to start: {error}", file=sys.stderr)
+            raise Failure(
+                "approval_unavailable", "Cannot open Rejig's approval window; check Rejig.app is installed, then try again."
+            ) from error
         assert child.stdin is not None
         child.stdin.write(json.dumps({"title": title, "lines": lines}).encode())
         child.stdin.close()
