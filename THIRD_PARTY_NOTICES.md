@@ -20,9 +20,11 @@ dependencies from their publishers; each comes under its own license.
 
 ## Modified upstream code
 
-`patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py`, and
+`patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py`,
 `patches/device-identity.patch` modifies `ios_homescreen/ui/session.py` and
-`ios_homescreen/ui/errors.py`. Both contain lines from those files. The installer applies
+`ios_homescreen/ui/errors.py`, and `patches/offloaded-apps.patch` modifies
+`ios_homescreen/device.py`, `planner.py` and `report.py`. Each contains lines from those
+files. The installer applies
 them to the user's own copy. ios-homescreen's license:
 
 ```text

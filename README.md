@@ -141,12 +141,12 @@ supported.
 
 ## Limits
 
-- The installer applies two patches to the engine. `patches/wifi-reconnect.patch`: a
+- The installer applies three patches to the engine. `patches/wifi-reconnect.patch`: a
   layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
   only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
   is the one the backup or layout came from before writing.
-- Apps that were offloaded may show up after a write even though the phone did not list
-  them before. Read the phone again and check the layout before you rely on it.
+  `patches/offloaded-apps.patch`: the app list includes offloaded apps, so a write keeps
+  the ones that are only in the App Library there instead of putting them back on a page.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
 - `srptools` stays at 1.0.1: version 2 reads pymobiledevice3's hex-encoded pairing proof
   as raw bytes and Wi-Fi pairing fails. Proof checking stays on.

@@ -1,0 +1,77 @@
+Rejig: keep apps that live only in the App Library there on every write, offloaded ones
+included. Applies to ios_homescreen/device.py, planner.py and report.py from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c. Installation Proxy lists placeholders
+(offloaded apps, apps still downloading) only when asked with ShowPlaceholders. Without
+them a write's ignored list misses them, and SpringBoard puts each one in the App Library
+back on a Home Screen page. The lookup now asks for placeholders and marks offloaded apps
+(IsDemotedApp); an offloaded app moved home is written in SpringBoard's own form, without
+bundleIdentifier. ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup Emre Yerli
+(full notice in THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+--- a/ios_homescreen/device.py
++++ b/ios_homescreen/device.py
+@@ -24,6 +24,7 @@
+     "CFBundleName",
+     "ApplicationType",
+     "SBAppTags",
++    "IsDemotedApp",
+ ]
+ SEND_TIMEOUT = 10.0
+ REPLY_TIMEOUT = 3.0
+@@ -172,6 +173,10 @@
+         Each is ``{"name", "type"}``, plus ``"hidden": True`` for system services that
+         iOS never shows (``SBAppTags`` contains ``hidden``). Hidden apps still have to be
+         listed in a write's ``ignored`` list, but they are not App Library apps.
++        Installation Proxy lists placeholders (offloaded apps, apps still downloading) only
++        with ``ShowPlaceholders``; a write that leaves one out of ``ignored`` puts it back
++        on a page. Offloaded apps (``IsDemotedApp``: no binary, only the icon) also get
++        ``"offloaded": True``.
+         """
+         service = self._installer_factory(self.lockdown)
+ 
+@@ -179,7 +184,11 @@
+             await service.connect()
+             try:
+                 return await service.lookup(
+-                    {"ApplicationType": "Any", "ReturnAttributes": APP_ATTRIBUTES}
++                    {
++                        "ApplicationType": "Any",
++                        "ShowPlaceholders": True,
++                        "ReturnAttributes": APP_ATTRIBUTES,
++                    }
+                 )
+             finally:
+                 await service.close()
+@@ -194,6 +203,8 @@
+                 continue
+             name = meta.get("CFBundleDisplayName") or meta.get("CFBundleName") or ident
+             apps[ident] = {"name": str(name), "type": str(kind)}
++            if meta.get("IsDemotedApp"):
++                apps[ident]["offloaded"] = True
+             tags = meta.get("SBAppTags")
+             if isinstance(tags, list | tuple) and "hidden" in tags:
+                 apps[ident]["hidden"] = True
+--- a/ios_homescreen/planner.py
++++ b/ios_homescreen/planner.py
+@@ -223,6 +223,9 @@
+         raw = self.raw.get(ident)
+         if raw is not None and item_kind(raw) == "app":
+             return deepcopy(raw)
++        if (self.installed.get(ident) or {}).get("offloaded"):
++            # SpringBoard's own form for an offloaded app: no bundleIdentifier.
++            return {"displayIdentifier": ident}
+         return {"bundleIdentifier": ident, "displayIdentifier": ident}
+ 
+     def app_by_id(self, ident: Any, where: Location) -> Any:
+--- a/ios_homescreen/report.py
++++ b/ios_homescreen/report.py
+@@ -101,7 +101,7 @@
+                 "name": str(meta.get("name", ident)),
+                 "id": ident,
+                 "type": app_type(meta) or "",
+-                "offloaded": False,
++                "offloaded": bool(meta.get("offloaded")),
+                 "where": {"section": "library"},
+             },
+         )

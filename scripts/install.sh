@@ -20,7 +20,8 @@ engine_dir="$("$python" -c 'import pathlib, ios_homescreen; print(pathlib.Path(i
 for engine_patch in "$project_dir"/patches/*.patch; do
     # --force: never guess "reversed", so this succeeds only when the patch is already applied.
     if ! /usr/bin/patch --dry-run --reverse --force --silent -p1 -d "$engine_dir" < "$engine_patch" >/dev/null 2>&1; then
-        /usr/bin/patch --batch --forward -p1 -d "$engine_dir" < "$engine_patch"
+        # Patches sharing a file apply at an offset; keep no .orig copy in site-packages.
+        /usr/bin/patch --batch --forward --no-backup-if-mismatch -p1 -d "$engine_dir" < "$engine_patch"
     fi
 done
 if [[ ! -d "$app" ]]; then
