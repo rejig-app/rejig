@@ -13,8 +13,9 @@ if [[ ! -x "$runtime_dir/.venv/bin/python3" ]]; then
     /opt/homebrew/bin/python3.13 -m venv "$runtime_dir/.venv"
 fi
 python="$runtime_dir/.venv/bin/python3"
-# Upstream's tested dependency set, hash-checked; then the engine itself at its pinned commit.
-"$python" -m pip install --require-hashes -r "$project_dir/requirements.lock"
+# Upstream's tested dependency set plus the MCP SDK's, hash-checked; then the engine itself
+# at its pinned commit.
+"$python" -m pip install --require-hashes -r "$project_dir/requirements.lock" -r "$project_dir/requirements-mcp.lock"
 # --force-reinstall: start from the unpatched engine every run, so an update whose patches
 # changed applies cleanly instead of meeting the previous run's patched files.
 "$python" -m pip install --no-deps --force-reinstall -r "$project_dir/requirements.txt"
@@ -23,6 +24,9 @@ for engine_patch in "$project_dir"/patches/*.patch; do
     # Patches sharing a file apply at an offset; keep no .orig copy in site-packages.
     /usr/bin/patch --batch --forward --no-backup-if-mismatch -p1 -d "$engine_dir" < "$engine_patch"
 done
+# The MCP companion (python -m rejig_mcp) runs in the same runtime; replace any older copy.
+rm -rf "$engine_dir/rejig_mcp"
+rsync -a --exclude __pycache__ "$project_dir/rejig_mcp" "$engine_dir/"
 # Always rebuild, so an update never installs an app built from older source.
 bash "$project_dir/scripts/build.sh"
 mkdir -p "$HOME/Applications"
@@ -30,3 +34,5 @@ rm -rf "$HOME/Applications/Rejig.app"
 ditto "$app" "$HOME/Applications/Rejig.app"
 codesign --verify --strict "$HOME/Applications/Rejig.app"
 echo "Installed: $HOME/Applications/Rejig.app"
+echo "To connect Claude Code, Codex or Claude Desktop, see \"Connect an AI client\" in README.md."
+echo "MCP server command: \"$python\" -m rejig_mcp"

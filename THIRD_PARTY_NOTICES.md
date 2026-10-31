@@ -17,14 +17,20 @@ dependencies from their publishers; each comes under its own license.
   taken from ios-homescreen's tested lockfile. Most are MIT, BSD, ISC or Apache-2.0;
   several pymobiledevice3 companions are GPL-3.0-or-later, pylzss is LGPL-3.0, and
   certifi and tqdm are MPL-2.0.
+- The [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp` and
+  `mcp-types` 2.3.0, MIT), for the MCP server, and the 11 packages it adds, listed with
+  exact versions and hashes in `requirements-mcp.lock`: attrs, jsonschema,
+  jsonschema-specifications, PyJWT, referencing, rpds-py and truststore (MIT); httpcore2,
+  httpx2 and sse-starlette (BSD-3-Clause); python-multipart (Apache-2.0).
 
 ## Modified upstream code
 
 `patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py`,
 `patches/device-identity.patch` modifies `ios_homescreen/ui/session.py` and
 `ios_homescreen/ui/errors.py`, and `patches/offloaded-apps.patch` modifies
-`ios_homescreen/device.py`, `planner.py` and `report.py`. Each contains lines from those
-files. The installer applies
+`ios_homescreen/device.py`, `planner.py` and `report.py`, and
+`patches/mcp-companion.patch` modifies `ios_homescreen/api.py`, `ui/session.py`,
+`ui/app.py` and `ui/static/js/actions.js`. Each contains lines from those files. The installer applies
 them to the user's own copy. ios-homescreen's license:
 
 ```text

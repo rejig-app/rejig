@@ -11,6 +11,15 @@ enum Connection: String, CaseIterable {
         case .demo: return ["--demo"]
         }
     }
+
+    /// The name the MCP companion uses: wifi, usb or demo.
+    var key: String {
+        switch self {
+        case .wifi: return "wifi"
+        case .usb: return "usb"
+        case .demo: return "demo"
+        }
+    }
 }
 
 func editorURL(from line: String) -> URL? {
@@ -22,6 +31,39 @@ func editorURL(from line: String) -> URL? {
     return url
 }
 
+func token(of url: URL) -> String? {
+    URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "token" })?.value
+}
+
+/// `rejig://connect?transport=wifi|usb|demo`, sent by the MCP companion's select_connection.
+func connectTransport(from url: URL) -> Connection? {
+    guard url.scheme == "rejig", url.host == "connect",
+          let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first(where: { $0.name == "transport" })?.value
+    else { return nil }
+    return Connection.allCases.first { $0.key == value }
+}
+
+/// Whether an editor `/api/job` answer says a read, apply or restore is running.
+/// Is a job running, by `/api/job`'s answer? `nil` when the answer tells nothing (no answer,
+/// another status, not the editor's JSON).
+func jobRunning(in data: Data?, status: Int = 200) -> Bool? {
+    guard status == 200, let data, let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          body.keys.contains("job") else { return nil }
+    return (body["job"] as? [String: Any])?["state"] as? String == "running"
+}
+
+/// What `Rejig --approve` shows: `{"title": String, "lines": [String]}` on stdin.
+func approvalRequest(from data: Data) -> (title: String, lines: [String])? {
+    guard data.count <= 1_000_000,
+          let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let title = body["title"] as? String, !title.isEmpty, title.count <= 300,
+          let lines = body["lines"] as? [String], !lines.isEmpty, lines.count <= 2_000,
+          lines.allSatisfy({ $0.count <= 400 && !$0.contains("\n") })
+    else { return nil }
+    return (title, lines)
+}
+
 if CommandLine.arguments.contains("--self-test") {
     precondition(editorURL(from: "Open: http://127.0.0.1:1234/?token=abc")?.port == 1234)
     precondition(editorURL(from: "Open: https://example.com/?token=abc") == nil)
@@ -30,9 +72,88 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(Connection.wifi.arguments == ["--wifi"])
     precondition(Connection.demo.arguments == ["--demo"])
     precondition(Connection.usb.arguments.isEmpty)
+    precondition(connectTransport(from: URL(string: "rejig://connect?transport=demo")!) == .demo)
+    precondition(connectTransport(from: URL(string: "rejig://connect?transport=wifi")!) == .wifi)
+    precondition(connectTransport(from: URL(string: "rejig://connect?transport=Wi-Fi")!) == nil)
+    precondition(connectTransport(from: URL(string: "rejig://apply?transport=usb")!) == nil)
+    precondition(connectTransport(from: URL(string: "https://connect?transport=usb")!) == nil)
+    precondition(jobRunning(in: Data(#"{"job":{"state":"running"}}"#.utf8)) == true)
+    precondition(jobRunning(in: Data(#"{"job":{"state":"done"}}"#.utf8)) == false)
+    precondition(jobRunning(in: Data(#"{"job":null}"#.utf8)) == false)
+    precondition(jobRunning(in: nil) == nil && jobRunning(in: Data("{}".utf8)) == nil)
+    precondition(jobRunning(in: Data(#"{"job":null}"#.utf8), status: 403) == nil)
+    precondition(approvalRequest(from: Data(#"{"title":"Write?","lines":["1. Mail moves"]}"#.utf8))?.lines.count == 1)
+    precondition(approvalRequest(from: Data(#"{"title":"Write?","lines":[]}"#.utf8)) == nil)
+    precondition(approvalRequest(from: Data(#"{"title":"Write?","lines":["a\nb"]}"#.utf8)) == nil)
+    precondition(approvalRequest(from: Data("not json".utf8)) == nil)
+    precondition(token(of: URL(string: "http://127.0.0.1:1/?token=abc")!) == "abc")
     print("Rejig self-check passed")
     exit(0)
 }
+
+/// `Rejig --approve`: one window asking the person to approve an AI client's change list.
+/// Exit 0 approve, 1 decline, 2 closed, timed out or unreadable input. Writes nothing.
+@MainActor
+final class Approval: NSObject, NSWindowDelegate {
+    var panel: NSPanel!
+
+    func show(title: String, lines: [String]) {
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        panel.title = "Rejig: approve a Home Screen change"
+        panel.level = .floating
+        panel.delegate = self
+        panel.isReleasedWhenClosed = false
+        let heading = NSTextField(wrappingLabelWithString: title)
+        heading.font = .boldSystemFont(ofSize: 14)
+        let note = NSTextField(wrappingLabelWithString:
+            "An AI assistant asked to make these changes on your iPhone. Approve only if you asked for them.")
+        note.textColor = .secondaryLabelColor
+        let list = NSTextView()
+        list.isEditable = false
+        list.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        list.string = lines.joined(separator: "\n")
+        list.setAccessibilityLabel("Changes")
+        let scroll = NSScrollView()
+        scroll.documentView = list
+        scroll.hasVerticalScroller = true
+        list.autoresizingMask = [.width]
+        list.isVerticallyResizable = true
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+        // Escape declines; Return does nothing, so approving always takes a deliberate click.
+        let decline = NSButton(title: "Decline", target: self, action: #selector(declined))
+        decline.keyEquivalent = "\u{1b}"
+        let approve = NSButton(title: "Approve", target: self, action: #selector(approved))
+        let buttons = NSStackView(views: [decline, approve])
+        let stack = NSStackView(views: [heading, note, scroll, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        panel.contentView = stack
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { exit(2) }
+    }
+
+    @objc func approved() { exit(0) }
+    @objc func declined() { exit(1) }
+    func windowWillClose(_ notification: Notification) { exit(2) }
+}
+
+if CommandLine.arguments.contains("--approve") {
+    guard let request = approvalRequest(from: FileHandle.standardInput.readDataToEndOfFile()) else { exit(2) }
+    let approval = Approval()
+    NSApplication.shared.setActivationPolicy(.accessory)
+    approval.show(title: request.title, lines: request.lines)
+    NSApplication.shared.run()
+    exit(2)
+}
+
+final class Answer: @unchecked Sendable { var running: Bool? }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
@@ -57,6 +178,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var receivedEditorState = false
 
     var python: URL { support.appendingPathComponent(".venv/bin/python3") }
+    /// Tells the MCP companion how to reach this editor; only while the editor runs.
+    var bridgeFile: URL { support.appendingPathComponent("mcp-bridge.json") }
+
+    func writeBridge() {
+        guard let url = pageURL, let port = url.port, let secret = token(of: url), let process = backend,
+              let data = try? JSONSerialization.data(withJSONObject: [
+                "port": port, "token": secret, "pid": Int(process.processIdentifier),
+                "connection": mode.key, "dirty": dirty,
+              ], options: [.sortedKeys])
+        else { return }
+        let temporary = support.appendingPathComponent(".mcp-bridge.json.tmp")
+        try? FileManager.default.removeItem(at: temporary)
+        guard FileManager.default.createFile(atPath: temporary.path, contents: data,
+                                             attributes: [.posixPermissions: 0o600]) else { return }
+        rename(temporary.path, bridgeFile.path)
+    }
+
+    func removeBridge() { try? FileManager.default.removeItem(at: bridgeFile) }
+
+    /// Is the editor running a job, whoever started it? The page only knows its own jobs;
+    /// an AI client's read or write runs in the same editor. `nil` when the editor does not
+    /// answer in time or answers oddly: it may be mid-write. One refusing the connection runs
+    /// nothing.
+    func editorBusy() -> Bool? {
+        guard backend != nil, let url = pageURL, let port = url.port, let secret = token(of: url),
+              let job = URL(string: "http://127.0.0.1:\(port)/api/job") else { return false }
+        var request = URLRequest(url: job, timeoutInterval: 2)
+        request.setValue("ihs_\(port)=\(secret)", forHTTPHeaderField: "Cookie")
+        request.setValue(secret, forHTTPHeaderField: "X-IHS-Token")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.connectionProxyDictionary = [:]
+        let answer = Answer()
+        let done = DispatchSemaphore(value: 0)
+        URLSession(configuration: configuration).dataTask(with: request) { data, response, error in
+            answer.running = (error as? URLError)?.code == .cannotConnectToHost
+                ? false : jobRunning(in: data, status: (response as? HTTPURLResponse)?.statusCode ?? 0)
+            done.signal()
+        }.resume()
+        guard done.wait(timeout: .now() + 3) == .success else { return nil }
+        return answer.running
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -157,9 +320,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func canLeaveEditor() -> Bool {
-        if transitioning || pairing != nil || busy {
+        let working = transitioning || pairing != nil || busy ? true : editorBusy()
+        if working == true {
             alert("Please wait for the current operation", "Let reading, applying, verification, or rollback finish before closing or reconnecting.")
             return false
+        }
+        if working == nil {
+            let panel = NSAlert()
+            panel.messageText = "Rejig's editor is not answering"
+            panel.informativeText = "An AI client may be writing to your iPhone through it, and leaving now could interrupt that write. Its backup stays in Show Backups."
+            panel.addButton(withTitle: "Wait")
+            panel.addButton(withTitle: "Leave Anyway")
+            guard panel.runModal() == .alertSecondButtonReturn else { return false }
         }
         guard dirty else { return true }
         let panel = NSAlert()
@@ -180,6 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         dirty = false
         receivedEditorState = false
         pageURL = nil
+        removeBridge()
         output = ""
         status.stringValue = mode == .demo ? "Demo · no phone contacted" : "\(mode.rawValue) · unlock your iPhone"
         let process = Process()
@@ -208,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     self.output.removeSubrange(...end)
                     if let url = editorURL(from: line) {
                         self.pageURL = url
+                        self.writeBridge()
                         self.webView.load(URLRequest(url: url))
                     }
                 }
@@ -217,6 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             Task { @MainActor in
                 guard let self, self.backend === stopped else { return }
                 self.backend = nil
+                self.removeBridge()
                 self.busy = false
                 self.status.stringValue = "Disconnected"
                 if !self.quitting {
@@ -233,6 +408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func stopEditor(_ done: @escaping @MainActor () -> Void) {
+        removeBridge()
         guard let process = backend else { done(); return }
         backend = nil
         process.terminationHandler = nil
@@ -248,6 +424,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc func changeConnection() {
         guard canLeaveEditor() else { picker.selectItem(withTitle: mode.rawValue); return }
         mode = Connection(rawValue: picker.titleOfSelectedItem ?? "") ?? .wifi
+        UserDefaults.standard.set(mode.rawValue, forKey: "connection")
+        stopEditor { self.startEditor() }
+    }
+
+    /// `rejig://connect?transport=…` from the MCP companion: switch only when nothing would
+    /// be interrupted or lost; otherwise say so here and leave it (no dialog).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let target = urls.lazy.compactMap(connectTransport(from:)).first, target != mode else { return }
+        if transitioning || pairing != nil || busy || dirty || editorBusy() != false {
+            status.stringValue = "An AI client asked for \(target.rawValue); finish the current work first"
+            return
+        }
+        mode = target
+        picker.selectItem(withTitle: mode.rawValue)
         UserDefaults.standard.set(mode.rawValue, forKey: "connection")
         stopEditor { self.startEditor() }
     }
@@ -329,7 +519,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         } else if backend != nil, let state = message.body as? [String: Bool] {
             receivedEditorState = true
             busy = state["busy"] ?? false
+            let wasDirty = dirty
             dirty = state["dirty"] ?? false
+            if dirty != wasDirty { writeBridge() }
         }
     }
 

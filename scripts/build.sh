@@ -30,6 +30,10 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>NSHighResolutionCapable</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Rejig connects to your paired iPhone to read and apply your Home Screen layout over Wi-Fi.</string>
 <key>NSBonjourServices</key><array><string>_remotepairing._tcp</string></array>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>app.rejig.mac</string>
+<key>CFBundleURLSchemes</key><array><string>rejig</string></array>
+</dict></array>
 </dict></plist>
 PLIST
 codesign --force --sign - "$app"

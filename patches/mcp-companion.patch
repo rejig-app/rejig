@@ -1,0 +1,241 @@
+Rejig: what the MCP companion needs from the editor. Applies to ios_homescreen/api.py,
+ui/session.py, ui/app.py and ui/static/js/actions.js from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c. The companion and the editor page share one editor
+session, and the page reloads the session's state only after its own jobs. Without a check, a
+draft the page planned before an MCP read and apply could overwrite that newer layout with no
+warning. /api/apply and /api/backups/restore now take an optional expect_read (the read file
+the plan was made against) and answer read_changed when the session has read the phone since;
+the page sends the read its draft is based on. A restore given expect_read also refuses, like
+apply, when the phone itself changed since that read, and one given expect_digest refuses
+(backup_changed) when the backup no longer holds what was approved. /api/state also names the
+folders this run keeps reads and backups in, which demo mode puts in a scratch folder.
+ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup Emre Yerli (full notice in
+THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+--- a/ios_homescreen/api.py
++++ b/ios_homescreen/api.py
+@@ -165,15 +165,21 @@
+     backup_dir: Path,
+     timing: Timing | None = None,
+     on_event: EventSink = ignore,
++    source_fingerprint: str | None = None,
+ ) -> ApplyResult:
+     """Write a backup (list or dictionary form, see :func:`load_backup`) like push does."""
+     validate_backup(target)
++    payload = to_payload(target)
+     # A backup has no source fingerprint: restoring is meant to overwrite.
++    # Rejig: unless the restore was approved against a read; then refuse when the phone
++    # changed since that read, like push does.
++    if source_fingerprint:
++        payload[PLAN_META_KEY] = {"source_fingerprint": source_fingerprint}
+     return await apply_state(
+         device,
+-        to_payload(target),
++        payload,
+         backup_dir=backup_dir,
+-        force=True,
++        force=not source_fingerprint,
+         timing=timing,
+         on_event=on_event,
+     )
+--- a/ios_homescreen/ui/app.py
++++ b/ios_homescreen/ui/app.py
+@@ -42,7 +42,7 @@
+ from ..state import StateError
+ from .errors import friendly
+ from .security import Guard, csp
+-from .session import Busy, LayoutProblems, NoRead, Session, ShowcaseOnly
++from .session import BackupChanged, Busy, LayoutProblems, NoRead, ReadChanged, Session, ShowcaseOnly
+ 
+ STATIC = Path(__file__).parent / "static"
+ MAX_BODY = 4 * 1024 * 1024
+@@ -96,6 +96,20 @@
+     if not isinstance(remove, list) or not all(isinstance(x, str) for x in remove):
+         raise ValueError("remove must be a list of ids")
+     return layout, remove
++
++
++def _expected(data: dict[str, Any]) -> str | None:
++    expected = data.get("expect_read")
++    if expected is not None and not isinstance(expected, str):
++        raise ValueError("expect_read must be a read file name")
++    return expected
++
++
++def _digest(data: dict[str, Any]) -> str | None:
++    expected = data.get("expect_digest")
++    if expected is not None and not isinstance(expected, str):
++        raise ValueError("expect_digest must be a SHA-256 hex string")
++    return expected
+ 
+ 
+ def _handle(exc: Exception) -> Response:
+@@ -107,6 +121,10 @@
+         return _error(403, "showcase", str(exc))
+     if isinstance(exc, Busy):
+         return _error(409, "busy", str(exc))
++    if isinstance(exc, ReadChanged):
++        return _error(409, "read_changed", str(exc))
++    if isinstance(exc, BackupChanged):
++        return _error(409, "backup_changed", str(exc))
+     if isinstance(exc, NoRead):
+         return _error(409, "no_read", str(exc))
+     if isinstance(exc, StateError):
+@@ -161,7 +179,9 @@
+         try:
+             data = await _body(request)
+             layout, remove = _layout(data)
+-            job = session.start_apply(layout, remove, force=bool(data.get("force", False)))
++            job = session.start_apply(
++                layout, remove, force=bool(data.get("force", False)), expect_read=_expected(data)
++            )
+         except Exception as exc:
+             return _handle(exc)
+         return JSONResponse({"job": job.to_dict()}, status_code=202)
+@@ -202,7 +222,9 @@
+     async def restore(request: Request) -> Response:
+         try:
+             data = await _body(request)
+-            job = session.start_restore(str(data.get("name", "")))
++            job = session.start_restore(
++                str(data.get("name", "")), expect_read=_expected(data), expect_digest=_digest(data)
++            )
+         except Exception as exc:
+             return _handle(exc)
+         return JSONResponse({"job": job.to_dict()}, status_code=202)
+--- a/ios_homescreen/ui/session.py
++++ b/ios_homescreen/ui/session.py
+@@ -16,6 +16,7 @@
+ import contextlib
+ import hashlib
+ import logging
++import plistlib
+ import secrets
+ from collections.abc import Awaitable, Callable, Iterable, Mapping
+ from dataclasses import dataclass, field, replace
+@@ -36,6 +37,7 @@
+     is_folder,
+     is_hidden_app,
+     item_kind,
++    fingerprint,
+     iter_items,
+     same_layout,
+ )
+@@ -77,6 +79,23 @@
+     code = showcase.SHOWCASE_CODE
+ 
+ 
++class ReadChanged(RuntimeError):
++    """The phone was read again after the layout or restore was planned."""
++
++    code = "read_changed"
++
++
++class BackupChanged(RuntimeError):
++    """Rejig: the backup's contents are not the ones the restore was approved with."""
++
++    code = "backup_changed"
++
++
++def backup_digest(target: Any) -> str:
++    """Rejig: what a restore writes, as a SHA-256 the MCP companion binds its plans to."""
++    return hashlib.sha256(plistlib.dumps(target, sort_keys=True)).hexdigest()
++
++
+ class NoRead(RuntimeError):
+     """Nothing has been read from the phone yet."""
+ 
+@@ -504,9 +523,15 @@
+         }
+ 
+     def start_apply(
+-        self, layout: Mapping[str, Any], remove: Iterable[str] = (), *, force: bool = False
++        self,
++        layout: Mapping[str, Any],
++        remove: Iterable[str] = (),
++        *,
++        force: bool = False,
++        expect_read: str | None = None,
+     ) -> Job:
+         self._refuse_in_showcase()
++        self._expect_read(expect_read)
+         plan, issues = self.plan(layout, remove)
+         if plan is None:
+             raise LayoutProblems(issues)
+@@ -519,19 +544,33 @@
+ 
+         return self._start("apply", work)
+ 
++    def _expect_read(self, name: str | None) -> None:
++        """Rejig: refuse when the plan was made against an earlier read than the current one."""
++        if name is not None and (self.read_file is None or self.read_file.name != name):
++            raise ReadChanged(
++                "The phone was read again after this was planned; review the current layout first."
++            )
++
+     def _refuse_in_showcase(self) -> None:
+         if self.settings.showcase is not None:
+             raise ShowcaseOnly("showcase mode never writes to the phone")
+ 
+-    def start_restore(self, name: str) -> Job:
++    def start_restore(
++        self, name: str, *, expect_read: str | None = None, expect_digest: str | None = None
++    ) -> Job:
+         self._refuse_in_showcase()
++        self._expect_read(expect_read)
+         path = self.backup_path(name)
+         target = api.load_backup(path)
++        if expect_digest is not None and backup_digest(target) != expect_digest:
++            raise BackupChanged("This backup changed after the restore was planned; nothing was written.")
+         # Rejig: load_backup drops the device; the backup belongs to the phone it records.
+         udid = device_of(path).get("udid")
++        # Rejig: a restore planned against a read refuses when the phone changed since it.
++        approved = fingerprint(self.read["state"]) if expect_read is not None and self.read else None
+ 
+         async def work(job: Job) -> dict[str, Any]:
+-            return await self._write_job(job, "restore", target, udid=udid)
++            return await self._write_job(job, "restore", target, udid=udid, approved=approved)
+ 
+         return self._start("restore", work)
+ 
+@@ -543,6 +582,7 @@
+         *,
+         force: bool = False,
+         udid: str | None = None,
++        approved: str | None = None,
+     ) -> dict[str, Any]:
+         self._refuse_in_showcase()
+         await self._release_icons()
+@@ -573,7 +613,7 @@
+             if kind == "apply":
+                 result = await api.push(device, target, force=force, **common)
+             else:
+-                result = await api.restore(device, target, **common)
++                result = await api.restore(device, target, source_fingerprint=approved, **common)
+             outcome = {k: v for k, v in result.to_dict().items() if k != "events"}
+             outcome["backup_name"] = result.backup.name
+             job.emit(Event("rereading", "Reading the home screen again..."))
+@@ -638,6 +678,9 @@
+             "job": self.job.to_dict() if self.job else None,
+             "icons": self.icon_state(),
+             "page_cells": PAGE_CELLS,
++            # Rejig: where this run keeps reads and backups (demo mode uses a scratch folder).
++            "data_dir": str(self.settings.data_dir),
++            "backup_dir": str(self.settings.backup_dir),
+         }
+ 
+     def icon_state(self) -> dict[str, Any]:
+--- a/ios_homescreen/ui/static/js/actions.js
++++ b/ios_homescreen/ui/static/js/actions.js
+@@ -296,7 +296,9 @@
+   const state = getState();
+   let job;
+   try {
+-    ({ job } = await post("/api/apply", { layout: ops.toLayout(state.draft), remove: state.removed, force }));
++    ({ job } = await post("/api/apply", {
++      layout: ops.toLayout(state.draft), remove: state.removed, force, expect_read: state.server?.read?.file,
++    }));
+   } catch (error) {
+     if (error instanceof ApiError && error.data.issues) {
+       setState({ check: { ...state.check, ok: false, issues: error.data.issues }, dialog: null });

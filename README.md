@@ -33,7 +33,7 @@ USB works too, and **Demo** mode lets you try everything on a pretend phone.
 - A Mac with Apple silicon (M1 or later) running macOS 15 or later.
 - Xcode Command Line Tools: `xcode-select --install`
 - [Homebrew](https://brew.sh) and Python 3.13: `brew install python@3.13`
-- An internet connection during installation (it downloads about 100 Python packages).
+- An internet connection during installation (it downloads about 120 Python packages).
 - An iPhone on iOS 17 or later for Wi-Fi mode.
 
 ## Install
@@ -53,7 +53,8 @@ USB works too, and **Demo** mode lets you try everything on a pretend phone.
 
    This builds `build/Rejig.app`, puts the app in `~/Applications/Rejig.app` and its
    runtime in `~/Library/Application Support/Rejig/.venv`. Dependencies are installed at
-   the exact versions, with hash checks, listed in `requirements.lock`.
+   the exact versions, with hash checks, listed in `requirements.lock` and
+   `requirements-mcp.lock` (the MCP SDK for [AI clients](#connect-an-ai-client)).
 
 3. Open it:
 
@@ -118,16 +119,85 @@ Wi-Fi mode uses the engine's userspace RemotePairing tunnel. It needs neither ro
 Developer Mode. Use one iPhone at a time: the engine refuses to guess when several phones
 are connected or paired.
 
-## AI clients (MCP)
+## Connect an AI client
 
-An MCP companion for Claude Desktop, Claude Code and Codex is in progress. This version has
-no MCP server yet. When it lands, this section will cover adding it to each client,
-checking it is connected, and example prompts.
+Rejig includes an MCP server, so Claude Code, Codex or Claude Desktop can read your Home
+Screen, plan a new arrangement with you, and apply it once you approve. It talks to the
+Rejig app on this Mac (the app opens if it is not running) and never to the phone directly.
+Choose **Demo** in the app first to try it on the pretend phone.
+
+The server command is the runtime's Python with `-m rejig_mcp`. Add it to your client:
+
+**Claude Code:**
+
+```bash
+claude mcp add --scope user rejig -- "$HOME/Library/Application Support/Rejig/.venv/bin/python3" -m rejig_mcp
+```
+
+Check it with `claude mcp list` (rejig shows as connected) or `/mcp` in a session.
+
+**Codex:**
+
+```bash
+codex mcp add rejig -- "$HOME/Library/Application Support/Rejig/.venv/bin/python3" -m rejig_mcp
+```
+
+Then give it time to wait for your approval and for the phone: in `~/.codex/config.toml`,
+under the `[mcp_servers.rejig]` table this command created, add `tool_timeout_sec = 600`.
+Check it with `codex mcp list` or `/mcp` in the Codex TUI.
+
+**Claude Desktop:** open `~/Library/Application Support/Claude/claude_desktop_config.json`
+(create it if needed) and add this; `sh` finds the runtime in your home folder, so it
+pastes as is:
+
+```json
+{
+  "mcpServers": {
+    "rejig": {
+      "command": "/bin/sh",
+      "args": ["-c", "exec \"$HOME/Library/Application Support/Rejig/.venv/bin/python3\" -m rejig_mcp"]
+    }
+  }
+}
+```
+
+If the file already has an `mcpServers` block, add the `"rejig"` entry inside it.
+
+Quit and reopen Claude Desktop; rejig then appears in the chat's list of tools.
+
+**Try it:**
+
+- "Use Rejig to read my iPhone Home Screen. What is on page 1?"
+- "Put my finance apps in a folder called Money on page 2 and show me the plan."
+- "Apply that plan."
+- "Here are my Screen Time minutes for last week: … Put the apps I use most on page 1."
+- "Restore the backup from before that change."
+
+**What needs your approval:** reading and drafting never touch the phone. Only applying
+writes, and only after you approve the exact numbered change list: in the chat, when the
+client can show a form (Claude Code can), or otherwise in Rejig's own Approve window on
+the Mac running Rejig, where you click Approve. Rejig always uses the window for Codex:
+in testing with Codex CLI 0.166.0, its TUI cancelled form requests without showing them.
+So an unattended `codex exec` run cannot write until someone clicks the window. You can
+always ask for the window ("approve it in the Rejig window").
+Each write saves a backup first and reads the phone back. Nothing is ever deleted or
+uninstalled, and apps that live only in the App Library stay there unless you ask.
+
+Know where that approval stops. Any program running as you on this Mac can do what you can,
+including answering a form or clicking a window, so the approval keeps a model from acting
+on its own; it is not a lock against other software. Don't add Claude Code hooks that
+answer MCP forms automatically.
+
+While an AI client is reading or writing, the Rejig window waits for it to finish before
+you can switch connection or quit; if its editor stops answering, Rejig asks before letting
+you leave, since a write may still be running. If the window has unsaved edits, the client is told so
+and does nothing until you apply, export or discard them.
 
 ## Your data
 
 - Layouts and backups: `~/Library/Application Support/Rejig/data/`
 - Cached app icons and wallpaper: `~/Library/Application Support/Rejig/cache/`
+- AI client plans and their outcomes: `~/Library/Application Support/Rejig/mcp/`
 - Connection errors: `~/Library/Application Support/Rejig/backend.log`
 - Wi-Fi pairing output: `~/Library/Application Support/Rejig/pairing.log`
 - Wi-Fi pairing credentials: pymobiledevice3's folder, `~/.local/share/pymobiledevice3/`
@@ -154,8 +224,12 @@ icons, opens the Apply preview, applies, checks the backup and readback, and res
 backup. It never contacts a real phone. It saves `demo-preview.png` in the app's data folder.
 
 The unit tests cover the Wi-Fi pairing proof format, the Wi-Fi reconnect patch
-(recovery, same-phone check, USB failure, cancellation) and the device identity patch
-(Restore and Apply refuse another iPhone and still write to the right one).
+(recovery, same-phone check, USB failure, cancellation), the device identity patch
+(Restore and Apply refuse another iPhone and still write to the right one) and the MCP
+server. The MCP tests start a real Demo editor and drive the server with the MCP SDK's own
+client, over both the older approval protocol and the 2026-07-28 one: approve, decline,
+cancel, stale and changed plans, unsaved edits, two clients applying one plan, a lost
+answer to a write, restores and recovery after a restart.
 
 ## Tested on
 
@@ -169,20 +243,26 @@ supported.
 
 ## Limits
 
-- The installer applies three patches to the engine. `patches/wifi-reconnect.patch`: a
+- The installer applies four patches to the engine. `patches/wifi-reconnect.patch`: a
   layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
   only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
   is the one the backup or layout came from before writing.
   `patches/offloaded-apps.patch`: the app list includes offloaded apps, so a write keeps
   the ones that are only in the App Library there instead of putting them back on a page.
+  `patches/mcp-companion.patch`: a write planned against one read is refused once the
+  phone has been read again or changed, and a restore is refused if its backup changed
+  after you approved it.
+- The MCP server arranges the layout only. It does not uninstall apps, create widgets or
+  read Screen Time; give it usage numbers yourself if you want it to sort by them.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
 - `srptools` stays at 1.0.1: version 2 reads pymobiledevice3's hex-encoded pairing proof
   as raw bytes and Wi-Fi pairing fails. Proof checking stays on.
 
 ## Credits
 
-Rejig is by keyclipse. The Mac window, connection controls, installer and the two engine
-patches are Rejig's own work, under the MIT license.
+Rejig is by keyclipse. The Mac window, connection controls, installer, MCP server and the
+engine patches are Rejig's own work, under the MIT license. The MCP server uses the
+[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) (MIT).
 
 Reading and writing the layout, the editor you see in the window and Demo mode come from
 [ios-homescreen](https://github.com/YakupEmreYerli/ios-homescreen) by Yakup Emre Yerli
