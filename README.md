@@ -240,7 +240,7 @@ answer to a write, restores and recovery after a restart.
 - iPhone: an iPhone 16 Pro on iOS 27.0.1, over USB and Wi-Fi: layout reads, writes with
   readback, and a backup restore.
 - AI clients on Demo: Claude Code 2.1.316 (approve, decline and cancel in the chat form);
-  Claude Desktop 2.110.0 (an apply, approved in Rejig's window); Codex CLI 0.149.0's TUI
+  Claude Desktop 4.4212.0 (an apply, approved in Rejig's window); Codex CLI 0.149.0's TUI
   (an apply and a restore, approved in Rejig's window); Codex CLI 0.166.0's TUI and
   `--yolo` (sent to Rejig's window; closing it wrote nothing). On that iPhone over Wi-Fi
   and over USB: an MCP write and restore, approved in Rejig's window.
