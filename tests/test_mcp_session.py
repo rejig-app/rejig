@@ -234,6 +234,99 @@ class SessionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.asked), 1)
             self.assertEqual(len(self.backups()), 1)
 
+    async def test_a_kept_spot_is_previewed_written_and_read_back(self):
+        # A move with a cell pins; Apply carries the editor's approval digest.
+        async with self.client() as client:
+            layout = data(await client.call_tool("read_layout", {}))
+            first, last = layout["dock"][0]["id"], len(layout["pages"])
+            pin = {"op": "move", "item": first, "to": {"section": "page", "page": last, "cell": 23}}
+            edited = await client.call_tool(
+                "edit_draft", {"draft_id": layout["draft_id"], "base_revision": 0, "operations": [pin]}
+            )
+            self.assertTrue(data(edited)["valid"], data(edited))
+            preview = data(await client.call_tool("preview_draft", {"draft_id": layout["draft_id"], "revision": 1}))
+            self.assertTrue(any("keeps its own spot" in line for line in preview["changes"]), preview["changes"])
+            result = await client.call_tool("apply_plan", {"plan_id": preview["plan_id"]})
+            self.assertEqual(data(result)["operation"]["state"], "applied", result.content)
+            again = data(await client.call_tool("read_layout", {"use_last": True}))
+            [kept] = [x for x in again["pages"][-1] if x["id"] == first]
+            self.assertEqual(kept["cell"], 23)
+            # Back into the flow, still last on the page: a pin-only change, not "unchanged".
+            unpin = {"op": "move", "item": first, "to": {"section": "page", "page": len(again["pages"])}}
+            await client.call_tool("edit_draft", {"draft_id": again["draft_id"], "base_revision": 0, "operations": [unpin]})
+            preview = await client.call_tool("preview_draft", {"draft_id": again["draft_id"], "revision": 1})
+            self.assertFalse(preview.is_error, preview.content)
+            self.assertEqual(len(data(preview)["changes"]), 1, data(preview)["changes"])
+            self.assertIn("no longer keeps its own spot", data(preview)["changes"][0])
+
+    async def pin_plan(self, client, *, from_dock=False, cell=23):
+        """Pin an app on the last page (the dock's first, or that page's last app): the preview."""
+        layout = data(await client.call_tool("read_layout", {}))
+        last = len(layout["pages"])
+        ident = layout["dock"][0]["id"] if from_dock else [x for x in layout["pages"][-1] if x["type"] == "app"][-1]["id"]
+        pin = {"op": "move", "item": ident, "to": {"section": "page", "page": last, "cell": cell}}
+        edited = await client.call_tool("edit_draft", {"draft_id": layout["draft_id"], "base_revision": 0, "operations": [pin]})
+        self.assertTrue(data(edited)["valid"], data(edited))
+        preview = await client.call_tool("preview_draft", {"draft_id": layout["draft_id"], "revision": 1})
+        self.assertFalse(preview.is_error, preview.content)
+        return {**data(preview), "pinned": ident}
+
+    async def test_an_early_cell_reads_back_as_the_plan(self):
+        # The pinned page is written in screen order, so the frozen target must be too.
+        async with self.client() as client:
+            plan = await self.pin_plan(client, from_dock=True, cell=0)
+            record = data(await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]}))["operation"]
+            self.assertEqual(record["state"], "applied", record)
+            self.assertTrue(record["matches_plan"])
+            again = data(await client.call_tool("read_layout", {"use_last": True}))
+            first = again["pages"][-1][0]
+            self.assertEqual((first["id"], first.get("cell")), (plan["pinned"], 0))
+
+    async def test_a_pin_only_write_is_reconciled_only_when_the_editor_recorded_it(self):
+        # iOS does not report spots, so the icon order alone cannot show a pin-only write landed.
+        real = server.editor.request
+        for reached, final_state in ((False, "outcome_unknown"), (True, "applied_reconciled")):
+
+            def lossy(method, path, body=None, **options):
+                if method == "POST" and path == "/api/apply":
+                    if reached:
+                        real(method, path, body, **options)
+                    raise EditorError("app_not_running", "Rejig's editor is not answering.")
+                return real(method, path, body, **options)
+
+            with self.subTest(reached=reached):
+                async with self.client() as client:
+                    plan = await self.pin_plan(client)
+                    with mock.patch.object(server.editor, "request", lossy):
+                        await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]})
+                    final = await self.settle(client, plan["plan_id"])
+                self.assertEqual(final["state"], final_state, final)
+
+    async def test_a_lost_unpin_only_write_stays_unknown(self):
+        # A failed write also clears the editor's pin record, so the read after a finished
+        # unpin and after a failed one look the same: order unchanged, no spots.
+        real = server.editor.request
+
+        def lossy(method, path, body=None, **options):
+            if method == "POST" and path == "/api/apply":
+                real(method, path, body, **options)
+                raise EditorError("app_not_running", "Rejig's editor is not answering.")
+            return real(method, path, body, **options)
+
+        async with self.client() as client:
+            plan = await self.pin_plan(client)
+            pinned = data(await client.call_tool("apply_plan", {"plan_id": plan["plan_id"]}))["operation"]
+            self.assertEqual(pinned["state"], "applied", pinned)
+            layout = data(await client.call_tool("read_layout", {"use_last": True}))
+            unpin = {"op": "move", "item": plan["pinned"], "to": {"section": "page", "page": len(layout["pages"])}}
+            await client.call_tool("edit_draft", {"draft_id": layout["draft_id"], "base_revision": 0, "operations": [unpin]})
+            preview = data(await client.call_tool("preview_draft", {"draft_id": layout["draft_id"], "revision": 1}))
+            with mock.patch.object(server.editor, "request", lossy):
+                await client.call_tool("apply_plan", {"plan_id": preview["plan_id"]})
+            final = await self.settle(client, preview["plan_id"])
+        self.assertEqual(final["state"], "outcome_unknown", final)
+        self.assertTrue(final["phone_matches_base"])
+
     async def test_declined_or_unapproved_or_cancelled_writes_nothing(self):
         answers = {
             "approval_declined": ElicitResult(action="decline"),

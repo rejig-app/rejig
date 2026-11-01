@@ -1,0 +1,116 @@
+Rejig: write a configured widget back under its element id. Applies to ios_homescreen/state.py from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c, after Rejig's other patches. A configured single
+widget shows its element id only as userSelectedElementIdentifier; the write now sends it
+as uniqueIdentifier too, so SpringBoard keeps the widget under that id instead of a fresh
+one that, per homescreen-mcp, orphans its settings. Stacks keep their keys as read (there the key names the
+element on show). Readback takes a single widget's id from uniqueIdentifier, else
+userSelectedElementIdentifier, and lets a missing id pass, since iOS drops it from some
+reads; two different ids still fail. Fingerprints keep the exact id. Method from homescreen-mcp
+(https://github.com/kats1123/homescreen-mcp, MIT, Copyright (c) 2026 Jonathan Kats).
+ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup Emre Yerli (full notice in
+THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+diff -ruN -x __pycache__ a/ios_homescreen/state.py b/ios_homescreen/state.py
+--- a/ios_homescreen/state.py
++++ b/ios_homescreen/state.py
+@@ -399,11 +399,19 @@
+ def normalize_for_write(item: Any) -> Any:
+     """Upgrade legacy ``iconType: folder`` folders to ``listType: folder``.
+ 
+-    SpringBoard silently drops folders written with ``iconType: folder``.
++    SpringBoard silently drops folders written with ``iconType: folder``. A configured
++    single widget shows its element id only as ``userSelectedElementIdentifier``; it is
++    written back as ``uniqueIdentifier`` too, or SpringBoard gives the widget a new id and
++    its settings are lost. In a stack that key names the element on show, so stacks keep
++    theirs as read.
+     """
+     if not isinstance(item, Mapping):
+         return deepcopy(item)
+     result = deepcopy(dict(item))
++    if _single_widget(result) and not result.get("uniqueIdentifier"):
++        chosen = result.get("userSelectedElementIdentifier")
++        if isinstance(chosen, str) and chosen:
++            result["uniqueIdentifier"] = chosen
+     if is_folder(result):
+         result.pop("iconType", None)
+         result["listType"] = "folder"
+@@ -463,19 +471,47 @@
+     )
+ 
+ 
+-def _canonical_item(item: Any) -> Any:
++def _single_widget(item: Any) -> bool:
++    return is_widget(item) and not item.get("elements")
++
++
++class _ReadbackWidgetId:
++    """A single widget's id as a re-read can show it: ``uniqueIdentifier``, else its alias
++    ``userSelectedElementIdentifier``, else nothing (iOS drops it from some reads).
++
++    A missing id matches anything; two ids must be equal.
++    """
++
++    __hash__ = None  # type: ignore[assignment]
++
++    def __init__(self, item: Mapping[str, Any]) -> None:
++        ids = (item.get("uniqueIdentifier"), item.get("userSelectedElementIdentifier"))
++        self.id = next((x for x in ids if isinstance(x, str) and x), None)
++
++    def __eq__(self, other: object) -> bool:
++        return isinstance(other, _ReadbackWidgetId) and (
++            self.id is None or other.id is None or self.id == other.id
++        )
++
++
++def _canonical_item(item: Any, readback: bool = False) -> Any:
+     if is_folder(item):
+         return (
+             "folder",
+             str(item.get("displayName", "")),
+-            tuple(tuple(_canonical_item(inner) for inner in page) for page in folder_pages(item)),
++            tuple(
++                tuple(_canonical_item(inner, readback) for inner in page)
++                for page in folder_pages(item)
++            ),
+         )
+     if is_widget(item):
+         return (
+             "widget",
+             item_id(item),
+             item.get("gridSize", "small"),
+-            item.get("uniqueIdentifier"),
++            _ReadbackWidgetId(item)
++            if readback and _single_widget(item)
++            else item.get("uniqueIdentifier"),
+             item.get("widgetIdentifier"),
+             item.get("containerBundleIdentifier"),
+             # userSelectedElementIdentifier is left out: SpringBoard drops it on
+@@ -485,20 +521,23 @@
+     return (item_kind(item), item_id(item))
+ 
+ 
+-def canonical(state: State) -> Any:
++def canonical(state: State, *, readback: bool = False) -> Any:
+     """Structural view of a layout: kinds, identifiers, order, folder contents.
+ 
+     Volatile metadata (modification dates, versions) and ``ignored`` are left out.
++    ``readback`` matches a single widget's id loosely (see :class:`_ReadbackWidgetId`);
++    fingerprints keep the exact id a read shows.
+     """
+     dock, pages = split_state(state)
+     return (
+-        tuple(_canonical_item(item) for item in dock),
+-        tuple(tuple(_canonical_item(item) for item in page) for page in pages),
++        tuple(_canonical_item(item, readback) for item in dock),
++        tuple(tuple(_canonical_item(item, readback) for item in page) for page in pages),
+     )
+ 
+ 
+ def same_layout(left: State, right: State) -> bool:
+-    return canonical(left) == canonical(right)
++    """Whether a read shows a planned layout (or two reads match), widget-id aliases allowed."""
++    return canonical(left, readback=True) == canonical(right, readback=True)
+ 
+ 
+ def fingerprint(state: State) -> str:

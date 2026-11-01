@@ -35,11 +35,12 @@ from mcp.server.mcpserver import (
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
+from ios_homescreen.api import load_backup
 from ios_homescreen.model import describe, describe_changes, match_folders, to_document
 from ios_homescreen.planner import plan_layout
 from ios_homescreen.report import app_places, change_summary
-from ios_homescreen.snapshots import device_of, load_pull, state_from_file
-from ios_homescreen.state import fingerprint, to_payload
+from ios_homescreen.snapshots import device_of, load_pull
+from ios_homescreen.state import fingerprint, same_layout
 from ios_homescreen.storage import PULLS, find_backup
 
 from . import draft as drafting
@@ -76,6 +77,14 @@ Rules:
   removed.
 - Usage for optimize_draft comes from the person (for example Settings > Screen Time >
   See All App & Website Activity). Never invent usage numbers.
+- Pages are ordered lists that fill row by row. An app, web clip or web app can instead
+  keep a spot: move it with to {section: "page", page, cell} (cell 0-23, row by row, 4 to
+  a row) and the rest flow around it, leaving gaps. read_layout shows such an item's cell.
+  Rejig remembers the spots it placed and sends them back with every write, but iOS
+  cannot confirm where icons end up. iOS does not tell Rejig about empty spaces made on
+  the iPhone itself, so those close on the next apply on any page, including pages the
+  plan does not change: tell the person before apply_plan. optimize_draft re-flows the
+  pages and drops kept spots.
 """
 
 READ_WAIT = 180.0
@@ -266,6 +275,8 @@ def compact(item: dict[str, Any]) -> dict[str, Any]:
         out["size"] = item.get("size")
     elif kind == "app" and item.get("offloaded"):
         out["offloaded"] = True
+    if "cell" in item:  # Rejig: it keeps this spot on its page
+        out["cell"] = item["cell"]
     return out
 
 
@@ -343,11 +354,14 @@ def backup_view(state: dict[str, Any], name: str) -> tuple[Path, dict[str, Any],
     both from one reading of the file."""
     read = current_read(state)
     path = find_backup(Path(state["backup_dir"]), name, allow_paths=False)
-    saved = state_from_file(path)
+    target = load_backup(path)  # the layout and the gaps Rejig had placed, as Restore writes them
     pull = load_pull(Path(state["data_dir"]) / PULLS / read["file"])
-    view = describe({"state": saved, "apps": pull.get("apps", {})})
+    view = describe({"state": target, "apps": pull.get("apps", {})})
+    for page, pins in zip(view["pages"], target.get("pins") or []):
+        if pins:
+            page["pins"] = pins
     match_folders(read["view"], view, prefix="backup")
-    return path, view, backup_digest(to_payload(saved))
+    return path, view, backup_digest(target)
 
 
 def target_fingerprint(state: dict[str, Any], layout: dict[str, Any]) -> str:
@@ -355,7 +369,57 @@ def target_fingerprint(state: dict[str, Any], layout: dict[str, Any]) -> str:
     plan of it against the current read, made as the editor makes it (empty pages dropped)."""
     pull = load_pull(Path(state["data_dir"]) / PULLS / current_read(state)["file"])
     kept = {"dock": layout["dock"], "pages": [page for page in layout["pages"] if page]}
-    return fingerprint(plan_layout(to_document(kept), pull, allow_removal=True).payload)
+    # Rejig: through to_layout, so a pinned page is fingerprinted in the screen order it is written in.
+    return fingerprint(plan_layout(to_document(drafting.to_layout(kept)), pull, allow_removal=True).payload)
+
+
+def page_pins(pages: list[Any]) -> list[dict[str, Any]]:
+    """Rejig: the spots kept on each non-empty page. iOS never reports them, so the editor's
+    read shows only the ones it recorded after a write resolved."""
+    return [dict(page.get("pins") or {}) for page in pages if isinstance(page, dict) and page.get("items")]
+
+
+def pulled_state(state: dict[str, Any], pull: str) -> Any:
+    return load_pull(Path(state["data_dir"]) / PULLS / pull)["state"]
+
+
+def planned_write(plan: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+    """Rejig: a layout plan's write rebuilt from its frozen read and layout, or None when the
+    frozen read is gone (an editor restart, a pruned pull) or no longer has the plan's base
+    fingerprint, or the rebuild does not carry the approved one: then nothing is compared loosely."""
+    if plan.get("kind") != "layout" or not plan.get("base_pull") or not state.get("data_dir"):
+        return None
+    source = Path(state["data_dir"]) / PULLS / plan["base_pull"]
+    if not source.is_file():
+        return None
+    pull = load_pull(source)
+    if fingerprint(pull["state"]) != plan.get("base_fingerprint"):
+        return None
+    layout = plan["layout"]
+    kept = {"dock": layout["dock"], "pages": [p for p in layout["pages"] if (p.get("items") if isinstance(p, dict) else p)]}
+    written = plan_layout(to_document(kept), pull, allow_removal=True).payload
+    return written if fingerprint(written) == plan["target_fingerprint"] else None
+
+
+def reads_as_target(plan: dict[str, Any], state: dict[str, Any], read: dict[str, Any]) -> bool:
+    """Rejig: whether the read shows the approved layout plan. The exact fingerprint, or else the
+    engine's own readback rule (state.same_layout) against the plan's rebuilt write: iOS can read
+    a configured widget back without the uniqueIdentifier it was written with (widget-ids.patch;
+    iPhone 16 Pro, iOS 27.0.1), while a different id still fails."""
+    if read["view"].get("fingerprint") == plan["target_fingerprint"]:
+        return True
+    written = planned_write(plan, state)
+    return written is not None and same_layout(written, pulled_state(state, read["file"]))
+
+
+def leaves_order(plan: dict[str, Any], state: dict[str, Any]) -> bool | None:
+    """Rejig: whether a plan's write reads the same as the read it was made from (it only
+    changes kept spots), or None when that cannot be told. Fingerprints alone miss it once a
+    configured widget's id is copied, so a missing or altered frozen read proves nothing."""
+    if plan["target_fingerprint"] == plan["base_fingerprint"]:
+        return True
+    written = planned_write(plan, state)
+    return None if written is None else same_layout(written, pulled_state(state, plan["base_pull"]))
 
 
 def verify(record: dict[str, Any], plan: dict[str, Any], state: dict[str, Any], success: str) -> dict[str, Any]:
@@ -375,7 +439,8 @@ def verify(record: dict[str, Any], plan: dict[str, Any], state: dict[str, Any], 
         "state": success,
         "message": None,
         "new_pull": read["file"],
-        "matches_plan": read["view"].get("fingerprint") == plan["target_fingerprint"],
+        "matches_plan": reads_as_target(plan, state, read)
+        and (plan.get("target_pins") is None or plan["target_pins"] == page_pins(read["view"].get("pages", []))),
         "library_check": library_check(record.get("library_before", []), library, **moves),
     }
     if not checked["matches_plan"]:
@@ -426,7 +491,10 @@ def form_supported(ctx: Context) -> bool:
 
 def approval_text(state: dict[str, Any], lines: list[str], plan_id: str) -> str:
     name = (state.get("device") or {}).get("name") or "the iPhone"
-    return f"Write these {len(lines)} changes to {name}? A backup is saved first. (Plan {plan_id[:12]})"
+    return (
+        f"Write these {len(lines)} changes to {name}? A backup is saved first. "
+        f"Empty spaces between icons may be lost on any page. (Plan {plan_id[:12]})"
+    )
 
 
 def public(record: dict[str, Any]) -> dict[str, Any]:
@@ -596,7 +664,7 @@ async def write(plan: dict[str, Any], ctx: Context) -> CallToolResult:
             body |= {"name": plan["backup"], "expect_digest": plan["backup_digest"]}
             job = (await call(editor.request, "POST", "/api/backups/restore", body))["job"]
         else:
-            body |= {"layout": plan["layout"], "remove": []}
+            body |= {"layout": plan["layout"], "remove": [], "expect_plan": plan.get("approval")}
             job = (await call(editor.request, "POST", "/api/apply", body))["job"]
     except EditorError as error:
         if error.code == "app_not_running":  # no answer: the request may still have reached it
@@ -784,8 +852,9 @@ async def get_app_icons(ids: list[str]) -> Annotated[CallToolResult, Icons]:
 async def edit_draft(draft_id: str, base_revision: int, operations: list[dict[str, Any]]) -> Annotated[CallToolResult, DraftRevision]:
     """Edit a draft (nothing touches the phone). operations run in order, all or nothing; each
     is one object whose "op" names it, e.g. {"op": "move", "item": ID, "to": {...}}:
-    move {item, to:{section: dock|page|folder, page?, index?, folder?}} (an App Library app id
-    brings it to the Home Screen; 1-based page and index; page N+1 makes a new page);
+    move {item, to:{section: dock|page|folder, page?, index?, cell?, folder?}} (an App Library
+    app id brings it to the Home Screen; 1-based page and index; page N+1 makes a new page;
+    cell 0-23 keeps that spot on the page with gaps around it, a move without one unpins);
     send_to_library {items}; folder_create {name, items, to?}; folder_rename {folder, name};
     folder_dissolve {folder}; page_add {at?}; page_remove {page} (empty pages only);
     page_move {from, to}; undo {to_revision} (alone). Items are ids from read_layout; a folder
@@ -829,6 +898,8 @@ async def preview_draft(draft_id: str, revision: int) -> Annotated[CallToolResul
         "target_fingerprint": target_fingerprint(state, current.layout),
         "backup": None,
         "backup_digest": None,
+        "approval": checked.get("approval"),  # Rejig: the editor refuses anything else
+        "target_pins": page_pins(drafting.to_layout(current.layout)["pages"]),
         "library_moves": library_moves(changes),
     }
     plan_id = save_plan(mcp_root(), plan)
@@ -871,6 +942,7 @@ async def preview_restore(ctx: Context, backup: str) -> Annotated[CallToolResult
         "target_fingerprint": view["fingerprint"],
         "backup": backup,
         "backup_digest": digest,
+        "target_pins": page_pins(view["pages"]),
         "library_moves": library_moves(changes),
     }
     plan_id = save_plan(mcp_root(), plan)
@@ -968,7 +1040,17 @@ async def get_operation(ctx: Context, plan_id: str) -> Annotated[CallToolResult,
         "new_backups": [name for name in await backup_names() if name not in known],
     }
     reconciled = verify(found, plan, state, "applied_reconciled")  # refuses another iPhone
-    if reconciled["state"] == "applied_reconciled":
+    # Rejig: a plan that only clears kept spots leaves the icon order as it was, and a failed
+    # write also clears the editor's pin record, so the read cannot show this plan was written.
+    # An order change that cannot be proven counts as none.
+    blind = not any(plan.get("target_pins") or []) and leaves_order(plan, state) is not False
+    if reconciled["state"] == "applied_reconciled" and blind:
+        reconciled |= {
+            "state": "outcome_unknown",
+            "message": "The phone shows this plan's icon order with no kept spots, which is also how it looks"
+            " after a failed write; read it and check where the icons sit.",
+        }
+    elif reconciled["state"] == "applied_reconciled":
         reconciled["message"] = "The phone shows this plan's layout."
     elif not reconciled["matches_plan"]:
         reconciled |= {

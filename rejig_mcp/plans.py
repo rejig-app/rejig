@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ios_homescreen.report import change_lines as engine_change_lines
-from ios_homescreen.snapshots import state_from_file
-from ios_homescreen.state import to_payload
+from ios_homescreen.api import load_backup
 
 BINDING = (
     "kind",
@@ -33,6 +32,8 @@ BINDING = (
     "target_fingerprint",
     "backup",
     "backup_digest",
+    "approval",
+    "target_pins",
 )
 NAME_LIMIT = 40
 ID_LIMIT = 80
@@ -113,7 +114,7 @@ def backup_digest(target: Any) -> str:
 
 
 def backup_digest_of(path: Path) -> str:
-    return backup_digest(to_payload(state_from_file(path)))
+    return backup_digest(load_backup(path))
 
 
 def read_journal(root: Path, ident: str) -> dict[str, Any] | None:

@@ -1,0 +1,31 @@
+Rejig: say before every Apply and Restore that empty spaces between icons may be lost.
+Applies to ios_homescreen/ui/static/js/dialogs.js from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c. SpringBoard's springboardservices read gives
+each page as an ordered list with no cell positions (formatVersion omitted and 1 to 4
+checked on iOS 26.7.1), and Rejig has no way to send them back. On an iPhone 15 Pro a
+hand-made gap on an unchanged page closed in each of two dock-only writes (2026-10-31).
+ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup Emre Yerli (full notice in
+THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+--- a/ios_homescreen/ui/static/js/dialogs.js
++++ b/ios_homescreen/ui/static/js/dialogs.js
+@@ -73,6 +73,9 @@
+           Widgets where you chose what they show may go back to their default choice after the write.
+         </div>`
+       : null}
++    <div class="callout">
++      Empty spaces you left between icons may be lost on any page, including pages you didn't change. iOS doesn't tell Rejig where they are, so it can't keep them.
++    </div>
+     <ol class="safety">
+       <li><span>1</span>Backup</li>
+       <li><span>2</span>Write</li>
+@@ -176,7 +179,7 @@
+   const showcase = Boolean(state.server?.showcase);
+   return html`<${Modal} title="Backups" wide>
+     <h3 class="modal-title">Backups</h3>
+-    <p class="modal-text">A backup is saved before every write. Restoring one writes it to the phone with the same checks as Apply (and backs up the current layout first).</p>
++    <p class="modal-text">A backup is saved before every write. Restoring one writes it to the phone with the same checks as Apply (and backs up the current layout first). Empty spaces you left between icons may be lost on any page.</p>
+     ${backups === null ? html`<div class="empty"><span class="spinner small"></span> Loading...</div>` : null}
+     ${showcase ? html`<div class="empty">Showcase mode does not list backups and cannot restore them.</div>` : null}
+     ${backups && !backups.length && !showcase ? html`<div class="empty">No backups yet. One is made before every Apply.</div>` : null}

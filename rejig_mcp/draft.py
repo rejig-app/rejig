@@ -2,7 +2,9 @@
 
 A draft layout is the editor page's own shape: ``{"dock": [item], "pages": [[item]]}``,
 with items as the editor's view gives them (``type``, ``id``, ``name``...), a folder being
-``{"type": "folder", "id", "name", "pages": [[item]]}``. The edits mirror the page's
+``{"type": "folder", "id", "name", "pages": [[item]]}``. An app, web clip or web app on a
+page may carry ``cell`` (0-23): it keeps that spot and the other items flow around it, as
+the editor's ``ops.js`` does. The edits mirror the page's
 ``ops.js`` (move, folders, pages); whether the result can be written is decided by the
 editor itself (``/api/plan``), with the same checks the page gets.
 """
@@ -18,6 +20,7 @@ from typing import Any
 
 FOLDER_SLOTS = 9
 FOLDABLE = frozenset({"app", "webclip", "webapp"})
+PAGE_CELLS = 24  # 6 rows of 4
 NAME_LIMIT = 40
 
 
@@ -28,19 +31,26 @@ class DraftError(Exception):
         self.index = index
 
 
+def _page_items(page: Any) -> list[Any]:
+    if not isinstance(page, Mapping):
+        return list(page)
+    pins = page.get("pins") or {}  # gaps Rejig placed: each pinned item carries its cell
+    return [{**item, "cell": pins[item["id"]]} if item.get("id") in pins else item for item in page.get("items", [])]
+
+
 def from_view(view: Mapping[str, Any]) -> dict[str, Any]:
     pages = view.get("pages", []) or []
-    return copy.deepcopy(
-        {
-            "dock": list(view.get("dock", []) or []),
-            "pages": [list(p.get("items", []) if isinstance(p, Mapping) else p) for p in pages],
-        }
-    )
+    return copy.deepcopy({"dock": list(view.get("dock", []) or []), "pages": [_page_items(p) for p in pages]})
+
+
+def _page_layout(items: list[Any]) -> dict[str, Any]:
+    pins = {item["id"]: item["cell"] for item in items if "cell" in item}
+    return {"items": items, "pins": pins} if pins else {"items": items}
 
 
 def to_layout(layout: Mapping[str, Any]) -> dict[str, Any]:
-    """The ``/api/plan`` and ``/api/apply`` body shape."""
-    return {"dock": layout["dock"], "pages": [{"items": items} for items in layout["pages"]]}
+    """The ``/api/plan`` and ``/api/apply`` body shape (Rejig puts a pinned page in screen order)."""
+    return {"dock": layout["dock"], "pages": [_page_layout(items) for items in layout["pages"]]}
 
 
 def _top(layout: Mapping[str, Any]) -> list[tuple[list[Any], int]]:
@@ -127,8 +137,16 @@ def _insert(items: list[Any], index: Any, item: Mapping[str, Any]) -> None:
 
 def _put(layout: dict[str, Any], item: dict[str, Any], to: Any) -> None:
     if not isinstance(to, Mapping):
-        raise DraftError("bad_operation", "to must be {section, page?, index?, folder?}.")
+        raise DraftError("bad_operation", "to must be {section, page?, index?, cell?, folder?}.")
     section = to.get("section")
+    item.pop("cell", None)  # a move without a cell puts the item back in the flow
+    cell = to.get("cell")
+    if cell is not None:
+        if section != "page" or item.get("type") not in FOLDABLE:
+            raise DraftError("not_pinnable", "Only an app, web clip or web app on a page can keep a cell.")
+        if isinstance(cell, bool) or not isinstance(cell, int) or not 0 <= cell < PAGE_CELLS:
+            raise DraftError("bad_cell", f"cell is 0 to {PAGE_CELLS - 1}: row by row, 4 to a row.")
+        item["cell"] = cell
     if section == "dock":
         if item.get("type") == "widget":
             raise DraftError("widget_in_dock", "Widgets cannot go in the dock.")
@@ -201,6 +219,7 @@ def _operation(layout: dict[str, Any], op: Mapping[str, Any], apps: Mapping[str,
             item = _take(layout, ref, apps)
             if item.get("type") not in FOLDABLE:
                 raise DraftError("not_foldable", "Only apps, web clips and web apps go in folders.")
+            item.pop("cell", None)
             taken.append(item)
         folder = {"type": "folder", "id": f"new-{secrets.token_hex(4)}", "name": name, "cells": 1}
         folder["pages"] = [taken]
@@ -227,7 +246,8 @@ def _operation(layout: dict[str, Any], op: Mapping[str, Any], apps: Mapping[str,
         raise DraftError(
             "bad_operation",
             f"Unknown operation {kind!r}. Each operation names itself in \"op\", e.g."
-            ' {"op": "move", "item": ID, "to": {"section": "page", "page": 1, "index": 1}};'
+            ' {"op": "move", "item": ID, "to": {"section": "page", "page": 1, "index": 1}}'
+            ' (or "cell": 0-23 instead of "index" to keep a spot with gaps around it);'
             " op is one of move, send_to_library, folder_create, folder_rename, folder_dissolve,"
             " page_add, page_remove, page_move, or undo (alone in its call).",
         )

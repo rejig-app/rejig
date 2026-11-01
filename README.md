@@ -238,20 +238,23 @@ answer to a write, restores and recovery after a restart.
 
 - Macs: Apple silicon on macOS 26.
 - iPhone: an iPhone 16 Pro on iOS 27.0.1, over USB and Wi-Fi: layout reads, writes with
-  readback, and a backup restore.
+  readback, and a backup restore; a gap placed in Rejig and a configured widget's setting,
+  checked on screen.
 - AI clients on Demo: Claude Code 2.1.316 (approve, decline and cancel in the chat form);
   Claude Desktop 4.4212.0 (an apply, approved in Rejig's window); Codex CLI 0.149.0's TUI
   (an apply and a restore, approved in Rejig's window); Codex CLI 0.166.0's TUI and
   `--yolo` (sent to Rejig's window; closing it wrote nothing). On that iPhone over Wi-Fi
   and over USB: an MCP write and restore, approved in Rejig's window.
+- iPhone: an iPhone 15 Pro on iOS 26.7.1, over USB: MCP writes with readback, with a
+  widget stack on the Home Screen.
 
-That is one phone. Apple can change the private Home Screen service in any iOS release,
+That is two phones. Apple can change the private Home Screen service in any iOS release,
 so try Demo first and keep the backup Rejig makes. Intel Macs, Windows and Linux are not
 supported.
 
 ## Limits
 
-- The installer applies four patches to the engine. `patches/wifi-reconnect.patch`: a
+- The installer applies eight patches to the engine. `patches/wifi-reconnect.patch`: a
   layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
   only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
   is the one the backup or layout came from before writing.
@@ -259,10 +262,38 @@ supported.
   the ones that are only in the App Library there instead of putting them back on a page.
   `patches/mcp-companion.patch`: a write planned against one read is refused once the
   phone has been read again or changed, and a restore is refused if its backup changed
-  after you approved it.
+  after you approved it. `patches/gaps-notice.patch`: the Apply and Backups windows say that
+  empty spaces between icons may be lost. `patches/pinned-gaps.patch`: a layout page can
+  pin apps and web clips to grid cells, and the write sends those pins so the empty spaces
+  around them stay (method from [homescreen-mcp](https://github.com/kats1123/homescreen-mcp),
+  MIT). `patches/widget-ids.patch`: a configured widget is written back
+  with the element id its settings are stored under (same source). On the iPhone 16 Pro a
+  small Weather widget kept its location through three applies, though iOS reads it back
+  under the setting's alias without echoing the `uniqueIdentifier` field. `patches/written-pins.patch`: the editor places an app on an
+  empty cell, Rejig remembers the gaps it placed for each iPhone, and every Apply, rollback
+  and Restore sends them back.
 - The MCP server arranges the layout only. It does not uninstall apps, create widgets or
   read Screen Time; give it usage numbers yourself if you want it to sort by them.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
+- Empty spaces made on the iPhone itself close on the first Apply or Restore, on any page,
+  including pages you did not change. iOS gives Rejig each page as an ordered list with no
+  cell positions, so Rejig cannot see them. On the iPhone 15 Pro, a gap on page 1 closed
+  in each of two dock-only applies that did not touch page 1. The read-back check cannot
+  see gaps, so it still passes.
+- Empty spaces you place in Rejig (drop an app on an empty cell, "Place in a spot...", or
+  an AI client's move to a cell) are remembered and sent back with every write. iOS cannot
+  confirm where icons end up, so the read-back check cannot see them. On the iPhone 16 Pro, a
+  gap Rejig placed on page 3 was on screen after its Apply and stayed through a dock-only
+  Apply. Restoring a backup that holds gaps, and restarting the phone, are not yet checked
+  on a phone. A page you change on the iPhone loses its remembered gaps. Backups made before
+  this version and layout files do not carry them, and `optimize_draft` re-flows the
+  pages without them.
+- Widgets: on the iPhone 15 Pro, one small widget stack read back with the same
+  size, widgets and top widget after two dock-only applies. Where it sat on screen and
+  each widget's own settings were not checked. On the iPhone 16 Pro, one small Weather
+  widget set to a city kept that city through three applies. Settings inside stacks are not
+  checked, so the editor still warns that widgets where you chose what they show may go back
+  to their default choice.
 - Demo's app icons are SVG, so the MCP server converts them to PNG with macOS's `sips`
   before sending them to an AI client. That was checked on macOS 26 only; where the
   conversion fails, those icons come back listed as missing.

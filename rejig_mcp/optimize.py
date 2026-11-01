@@ -140,7 +140,10 @@ def optimize(
                     continue
                 item["pages"] = [kept[i : i + 9] for i in range(0, len(kept), 9)]
             rest.append(item)
-    result["pages"] = _paginate([found[ident] for ident in ranked] + rest)
+    # Rejig: the pages flow again from the top, so gaps Rejig placed are not kept.
+    result["pages"] = _paginate(
+        {k: v for k, v in item.items() if k != "cell"} for item in [found[ident] for ident in ranked] + rest
+    )
 
     return {
         "layout": result,

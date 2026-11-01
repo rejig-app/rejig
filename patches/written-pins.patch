@@ -1,0 +1,1257 @@
+Rejig: remember the gaps Rejig placed, per iPhone, and send them back with every write.
+Applies to ios_homescreen/state.py, snapshots.py, api.py, workflow.py, model.py, report.py,
+ui/app.py, ui/session.py and the editor's static files from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c, after Rejig's other patches. A read never shows
+gaps, so Rejig keeps the pins of each verified write in DATA_DIR/pins.json, bound to each
+page as the verifying read showed it. A later read gets them back only on pages that still
+read the same, and a write's backup and rollback carry them, so Restore puts gaps back.
+In the editor, dropping an app on an empty cell (or "Place in a spot...") pins it, and
+dragging it into the flow (or "Move back in line") unpins it. Pin changes count as changes,
+with their own wording. Apply writes only the plan that was reviewed. A damaged or
+unsaved pins.json, or a write the phone was not read back after, stops writes, so stale
+gaps are never sent. No code is adapted from
+homescreen-mcp here; pinned-gaps.patch credits the method. ios-homescreen is MIT-licensed,
+Copyright (c) 2026 Yakup Emre Yerli (full notice in THIRD_PARTY_NOTICES.md). This patch is
+MIT.
+
+diff -ruN -x __pycache__ a/ios_homescreen/api.py b/ios_homescreen/api.py
+--- a/ios_homescreen/api.py
++++ b/ios_homescreen/api.py
+@@ -34,10 +34,12 @@
+ from .model import describe, describe_changes, to_document
+ from .paths import cache_dir, data_dir
+ from .planner import LayoutError, LayoutIssue, Plan, changes_between, load_layout, plan_layout
+-from .snapshots import load_pull, make_read, state_from_file
++from .snapshots import load_pull, make_read
+ from .state import (
++    PINS_KEY,
+     PLAN_META_KEY,
+     StateError,
++    load_plist,
+     to_payload,
+     validate_backup,
+     validate_plan,
+@@ -84,6 +86,7 @@
+     "find_backup",
+     "find_pull",
+     "list_backups",
++    "backup_target",
+     "load_backup",
+     "load_layout",
+     "load_pull",
+@@ -133,9 +136,20 @@
+     """Load a backup, pull snapshot or state plist and return it as a restore target."""
+     if Path(path).suffix.lower() == ".json":
+         raise StateError("restore needs a plist; JSON dumps lose dates and binary data")
+-    state = state_from_file(path)
++    data = load_plist(path)
++    state = data["state"] if isinstance(data, dict) and "state" in data else data
+     if isinstance(state, dict) and PLAN_META_KEY in state:
+         raise StateError(f"{path} is a plan, not a backup")
++    return backup_target(data)
++
++
++def backup_target(data: Any) -> dict[str, Any]:
++    """Rejig: what restoring a loaded backup, pull or state plist writes: its layout and the
++    gaps Rejig had placed when the backup was made (see :func:`~.snapshots.make_backup`)."""
++    state = data["state"] if isinstance(data, dict) and "state" in data else data
++    if state is not data and PINS_KEY in data:
++        validate_backup(state)
++        state = {**to_payload(state), PINS_KEY: data[PINS_KEY]}
+     validate_backup(state)
+     return to_payload(state)
+ 
+@@ -148,13 +162,21 @@
+     force: bool = False,
+     timing: Timing | None = None,
+     on_event: EventSink = ignore,
++    known_pins: Any = None,
+ ) -> ApplyResult:
+     """Write a plan: back up, refuse if the phone changed since the pull (unless
+-    ``force``), write, verify by re-reading, roll back on failure."""
++    ``force``), write, verify by re-reading, roll back on failure. Rejig: ``known_pins`` is
++    the record of gaps Rejig placed earlier (see :func:`~.workflow.apply_state`)."""
+     payload = plan.payload if isinstance(plan, Plan) else plan
+     validate_plan(payload)
+     return await apply_state(
+-        device, payload, backup_dir=backup_dir, force=force, timing=timing, on_event=on_event
++        device,
++        payload,
++        backup_dir=backup_dir,
++        force=force,
++        timing=timing,
++        on_event=on_event,
++        known_pins=known_pins,
+     )
+ 
+ 
+@@ -166,6 +188,7 @@
+     timing: Timing | None = None,
+     on_event: EventSink = ignore,
+     source_fingerprint: str | None = None,
++    known_pins: Any = None,
+ ) -> ApplyResult:
+     """Write a backup (list or dictionary form, see :func:`load_backup`) like push does."""
+     validate_backup(target)
+@@ -182,6 +205,7 @@
+         force=not source_fingerprint,
+         timing=timing,
+         on_event=on_event,
++        known_pins=known_pins,
+     )
+ 
+ 
+diff -ruN -x __pycache__ a/ios_homescreen/model.py b/ios_homescreen/model.py
+--- a/ios_homescreen/model.py
++++ b/ios_homescreen/model.py
+@@ -349,13 +349,19 @@
+     ``pages`` when the number of pages changes. ``from`` and ``to`` say where, with
+     1-based ``page`` and ``index`` and the folder's ``name`` when inside one. Folders
+     are matched by ``id``; folders a client creates need ids of their own.
++
++    Rejig: pages may carry ``pins`` ({item id: cell}); ``pinned`` (``to`` has the page and
++    the 0-based ``cell``) and ``unpinned`` (``from`` has the page) say where they change.
+     """
+     old, old_containers = _placements(before)
+     new, new_containers = _placements(after)
++    pins_before, pins_after = _pin_places(before), _pin_places(after)
++    # Rejig: a pinned item's place in the list means nothing (its cell says where it goes),
++    # so only the order of the items that flow counts.
+     in_order = {
+         key: _kept_in_order(
+-            [i for i in old_containers.get(key, []) if new.get(i, {}).get("container") == key],
+-            [i for i in ids if old.get(i, {}).get("container") == key],
++            [i for i in old_containers.get(key, []) if new.get(i, {}).get("container") == key and i not in pins_after],
++            [i for i in ids if old.get(i, {}).get("container") == key and i not in pins_after],
+         )
+         for key, ids in new_containers.items()
+     }
+@@ -373,7 +379,7 @@
+             placed.append(
+                 {"kind": "moved", **_subject(item), "from": was["where"], "to": now["where"]}
+             )
+-        elif ident not in in_order.get(now["container"], set()):
++        elif ident not in pins_after and ident not in in_order.get(now["container"], set()):
+             placed.append(
+                 {"kind": "reordered", **_subject(item), "from": was["where"], "to": now["where"]}
+             )
+@@ -396,8 +402,34 @@
+             later.append({"kind": "removed", **_subject(item), "from": was["where"]})
+         else:
+             later.append({"kind": "to_library", **_subject(item), "from": was["where"]})
++    pinned = [
++        {"kind": "pinned", **_subject(new[ident]["item"]), "to": {"section": "page", "page": page, "cell": cell}}
++        for ident, (page, cell) in pins_after.items()
++        if ident in new and pins_before.get(ident) != (page, cell)
++    ]
++    pinned += [
++        {"kind": "unpinned", **_subject(new[ident]["item"]), "from": {"section": "page", "page": page}}
++        for ident, (page, _) in pins_before.items()
++        if ident in new and ident not in pins_after
++    ]
+     pages_before = sum(1 for page in _view_pages(before) if page)
+     pages_after = sum(1 for page in _view_pages(after) if page)
+     if pages_before != pages_after:
+         later.append({"kind": "pages", "before": pages_before, "after": pages_after})
+-    return placed + later
++    return placed + pinned + later
++
++
++def _pin_places(layout: Mapping[str, Any]) -> dict[str, tuple[int, Any]]:
++    """Rejig: ``{item id: (page number, cell)}`` for pinned items, pages numbered like
++    :func:`_placements` (empty pages skipped)."""
++    found: dict[str, tuple[int, Any]] = {}
++    pages = layout.get("pages", [])
++    page_no = 0
++    for page in pages if isinstance(pages, list) else []:
++        if not _page_items(page):
++            continue
++        page_no += 1
++        pins = page.get("pins") if isinstance(page, Mapping) else None
++        for ident, cell in (pins or {}).items() if isinstance(pins, Mapping) else ():
++            found[str(ident)] = (page_no, cell)
++    return found
+diff -ruN -x __pycache__ a/ios_homescreen/report.py b/ios_homescreen/report.py
+--- a/ios_homescreen/report.py	2026-10-31 13:31:42
++++ b/ios_homescreen/report.py	2026-10-31 13:49:59
+@@ -159,6 +159,11 @@
+         return f'was "{change.get("old_name", "")}"'
+     if kind == "folder_deleted":
+         return "is removed (its apps are listed on their own)"
++    if kind == "pinned":
++        row, col = divmod(int((to or {}).get("cell", 0)), 4)
++        return f"keeps its own spot: row {row + 1}, column {col + 1} of {_container(to or {})}"
++    if kind == "unpinned":
++        return f"no longer keeps its own spot on {_container(was or {})}; it moves up into line"
+     return kind
+ 
+ 
+@@ -194,6 +199,8 @@
+         (count("removed"), "removed"),
+         (count("folder_renamed"), "renamed"),
+         (count("folder_deleted"), "folders removed"),
++        (count("pinned"), "placed in a spot"),
++        (count("unpinned"), "back in line"),
+     ):
+         if number:
+             parts.append(f"{number} {label}")
+diff -ruN -x __pycache__ a/ios_homescreen/snapshots.py b/ios_homescreen/snapshots.py
+--- a/ios_homescreen/snapshots.py	2026-10-31 13:31:41
++++ b/ios_homescreen/snapshots.py	2026-10-31 13:48:57
+@@ -11,7 +11,7 @@
+ from pathlib import Path
+ from typing import Any
+ 
+-from .state import StateError, load_plist
++from .state import PINS_KEY, StateError, load_plist
+ 
+ PULL_FORMAT = "ios-homescreen.pull"
+ BACKUP_FORMAT = "ios-homescreen.backup"
+@@ -61,15 +61,24 @@
+     return snapshot
+ 
+ 
+-def make_backup(state: Any, *, device: Mapping[str, Any] | None = None) -> dict[str, Any]:
+-    """A backup: the layout exactly as the phone reported it, and which phone that was."""
+-    return {
++def make_backup(
++    state: Any, *, device: Mapping[str, Any] | None = None, pins: Any = None
++) -> dict[str, Any]:
++    """A backup: the layout exactly as the phone reported it, and which phone that was.
++
++    Rejig: ``pins`` (one ``{item id: cell}`` table per page) are the gaps Rejig had placed
++    on that layout; a read cannot show them, so they sit beside the state, never in it.
++    """
++    backup = {
+         "format": BACKUP_FORMAT,
+         "version": FORMAT_VERSION,
+         "created": utc_now(),
+         "device": device_details(device),
+         "state": state,
+     }
++    if pins and any(pins):
++        backup[PINS_KEY] = [dict(page_pins) for page_pins in pins]
++    return backup
+ 
+ 
+ def load_pull(path: Path) -> dict[str, Any]:
+diff -ruN -x __pycache__ a/ios_homescreen/state.py b/ios_homescreen/state.py
+--- a/ios_homescreen/state.py	2026-10-31 13:31:42
++++ b/ios_homescreen/state.py	2026-10-31 13:51:15
+@@ -310,6 +310,48 @@
+             raise _pin_error("a pinned page must be sent in screen order")
+ 
+ 
++def page_key(page: Iterable[Any]) -> str:
++    """Rejig: SHA-256 of one page's items and order, the way :func:`fingerprint` sees them."""
++    text = json.dumps([_canonical_item(item) for item in page], ensure_ascii=False, separators=(",", ":"))
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()
++
++
++def pin_record(state: State, pins: Any) -> list[dict[str, Any]]:
++    """Rejig: the pins a write left on the phone, each bound to its page as ``state`` (the
++    read that verified the write) shows it: ``[{"key": page_key, "pins": {id: cell}}]``."""
++    _, pages = split_state(state)
++    return [
++        {"key": page_key(page), "pins": dict(page_pins)}
++        for page, page_pins in zip(pages, pins or [])
++        if page_pins
++    ]
++
++
++def reconcile_pins(record: Any, state: State) -> list[dict[str, int]] | None:
++    """Rejig: per page of ``state``, the pins of ``record`` still true of it; ``None`` if none.
++
++    Reads never show pins, so a page keeps its pins only while it reads back exactly as
++    written (same items in the same order) and they still put it in that order. Any edit
++    on the phone that changes the page drops them.
++    """
++    known: dict[str, dict[str, Any] | None] = {}
++    for entry in record if isinstance(record, list) else []:
++        if isinstance(entry, Mapping) and isinstance(entry.get("key"), str) and isinstance(entry.get("pins"), Mapping):
++            # Two entries for one page are ambiguous: that page keeps no pins.
++            known[entry["key"]] = None if entry["key"] in known else dict(entry["pins"])
++    _, pages = split_state(state)
++    found: list[dict[str, int]] = []
++    for page in pages:
++        pins = known.get(page_key(page)) or {}
++        try:
++            if pins and [item for _, item in place_page(page, pins)] != list(page):
++                pins = {}
++        except StateError:
++            pins = {}
++        found.append(pins)
++    return found if any(found) else None
++
++
+ # --------------------------------------------------------------------------- state shape
+ 
+ 
+@@ -648,11 +690,16 @@
+         _check_sections(state[0], state[1:])
+         return
+     if isinstance(state, dict):
+-        if set(state) != PAYLOAD_KEYS:
++        if not PAYLOAD_KEYS <= set(state) <= PAYLOAD_KEYS | {PINS_KEY}:
+             raise StateError(
+                 "a dictionary backup must contain exactly buttonBar, iconLists and ignored"
++                f" (and optionally {PINS_KEY})"
+             )
+         _check_sections(state["buttonBar"], state["iconLists"], state["ignored"])
++        # Rejig: the gaps Rejig had placed when the backup was made, one table per page.
++        for page, page_pins in zip(state["iconLists"], _page_pins(state, state["iconLists"]) or []):
++            if page_pins:
++                place_page(page, page_pins)
+         return
+     raise StateError("a backup must be a list-form or dictionary-form icon state")
+ 
+diff -ruN -x __pycache__ a/ios_homescreen/ui/app.py b/ios_homescreen/ui/app.py
+--- a/ios_homescreen/ui/app.py
++++ b/ios_homescreen/ui/app.py
+@@ -42,7 +42,17 @@
+ from ..state import StateError
+ from .errors import friendly
+ from .security import Guard, csp
+-from .session import BackupChanged, Busy, LayoutProblems, NoRead, ReadChanged, Session, ShowcaseOnly
++from .session import (
++    BackupChanged,
++    Busy,
++    LayoutProblems,
++    NoRead,
++    PinStoreError,
++    PlanChanged,
++    ReadChanged,
++    Session,
++    ShowcaseOnly,
++)
+ 
+ STATIC = Path(__file__).parent / "static"
+ MAX_BODY = 4 * 1024 * 1024
+@@ -105,10 +115,10 @@
+     return expected
+ 
+ 
+-def _digest(data: dict[str, Any]) -> str | None:
+-    expected = data.get("expect_digest")
++def _digest(data: dict[str, Any], key: str = "expect_digest") -> str | None:
++    expected = data.get(key)
+     if expected is not None and not isinstance(expected, str):
+-        raise ValueError("expect_digest must be a SHA-256 hex string")
++        raise ValueError(f"{key} must be a SHA-256 hex string")
+     return expected
+ 
+ 
+@@ -125,6 +135,10 @@
+         return _error(409, "read_changed", str(exc))
+     if isinstance(exc, BackupChanged):
+         return _error(409, "backup_changed", str(exc))
++    if isinstance(exc, PlanChanged):
++        return _error(409, "plan_changed", str(exc))
++    if isinstance(exc, PinStoreError):
++        return _error(409, "pins_unsaved", str(exc))
+     if isinstance(exc, NoRead):
+         return _error(409, "no_read", str(exc))
+     if isinstance(exc, StateError):
+@@ -180,7 +194,11 @@
+             data = await _body(request)
+             layout, remove = _layout(data)
+             job = session.start_apply(
+-                layout, remove, force=bool(data.get("force", False)), expect_read=_expected(data)
++                layout,
++                remove,
++                force=bool(data.get("force", False)),
++                expect_read=_expected(data),
++                expect_plan=_digest(data, "expect_plan"),
+             )
+         except Exception as exc:
+             return _handle(exc)
+diff -ruN -x __pycache__ a/ios_homescreen/ui/session.py b/ios_homescreen/ui/session.py
+--- a/ios_homescreen/ui/session.py
++++ b/ios_homescreen/ui/session.py
+@@ -15,7 +15,9 @@
+ import asyncio
+ import contextlib
+ import hashlib
++import json
+ import logging
++import os
+ import plistlib
+ import secrets
+ from collections.abc import Awaitable, Callable, Iterable, Mapping
+@@ -33,13 +35,17 @@
+ from ..snapshots import device_of
+ from ..state import (
+     PAGE_CELLS,
++    PINS_KEY,
++    PLAN_META_KEY,
+     StateError,
+     is_folder,
+     is_hidden_app,
+     item_kind,
+     fingerprint,
+     iter_items,
++    reconcile_pins,
+     same_layout,
++    split_state,
+ )
+ from ..storage import find_backup, list_backups, save_pull
+ from ..transport import Backend, Transport, TransportError
+@@ -102,6 +108,114 @@
+     code = "no_read"
+ 
+ 
++class PlanChanged(RuntimeError):
++    """Rejig: the layout plans to something other than the changes the user approved."""
++
++    code = "plan_changed"
++
++
++class PinStoreError(RuntimeError):
++    """Rejig: the file of gaps Rejig placed is damaged or could not be saved."""
++
++    code = "pins_unsaved"
++
++
++PINS_FILE = "pins.json"
++_HEX = frozenset("0123456789abcdef")
++
++
++def _valid_record(record: Any) -> bool:
++    return isinstance(record, list) and all(
++        isinstance(entry, dict)
++        and set(entry) == {"key", "pins"}
++        and isinstance(entry["key"], str)
++        and len(entry["key"]) == 64
++        and set(entry["key"]) <= _HEX
++        and isinstance(entry["pins"], dict)
++        and entry["pins"]
++        and all(
++            isinstance(k, str) and type(v) is int and 0 <= v < PAGE_CELLS
++            for k, v in entry["pins"].items()
++        )
++        for entry in record
++    )
++
++
++class PinStore:
++    """Rejig: per phone (UDID), the gaps Rejig placed, as :func:`~..state.pin_record` records.
++
++    A read cannot show gaps, so this file is the only memory of them. It changes only once
++    a write resolves. While the file is damaged, or the last save failed, writes are
++    refused so stale gaps are never sent.
++    """
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++        self._records: dict[str, Any] | None = None
++        self.damaged: str | None = None
++        self.unsaved = False
++
++    def _load(self) -> dict[str, Any]:
++        if self._records is None:
++            try:
++                data = json.loads(self.path.read_text(encoding="utf-8"))
++            except FileNotFoundError:
++                data = {}
++            except (OSError, ValueError) as exc:
++                self.damaged, data = str(exc), {}
++            if not isinstance(data, dict) or not all(
++                isinstance(k, str) and _valid_record(v) for k, v in data.items()
++            ):
++                self.damaged, data = self.damaged or "unexpected contents", {}
++            self._records = data
++        return self._records
++
++    def get(self, udid: str | None) -> Any:
++        return self._load().get(udid) if udid else None
++
++    def put(self, udid: str, record: list[dict[str, Any]] | None) -> None:
++        records = dict(self._load())
++        if record:
++            records[udid] = record
++        else:
++            records.pop(udid, None)
++        self._records = records
++        self.unsaved = True
++        self._save()
++
++    def _save(self) -> None:
++        try:
++            self.path.parent.mkdir(parents=True, exist_ok=True)
++            temp = self.path.with_name(f".{self.path.name}.tmp")
++            temp.write_text(json.dumps(self._records, indent=1, sort_keys=True), encoding="utf-8")
++            os.replace(temp, self.path)
++        except OSError as exc:
++            raise PinStoreError(
++                f"Rejig could not save where the gaps it placed are ({self.path}): {exc}. "
++                "Nothing more is written until it can."
++            ) from exc
++        self.unsaved = False
++
++    def check_writable(self) -> None:
++        """Refuse a write while a damaged or unsaved file could send stale gaps."""
++        if self.damaged and not self.path.exists():
++            self._records, self.damaged = None, None  # the user deleted the damaged file
++        self._load()
++        if self.damaged:
++            raise PinStoreError(
++                f"Rejig's file of gaps it placed is damaged ({self.path}: {self.damaged}). "
++                "Delete it to go on; the gaps Rejig placed then close on the next Apply."
++            )
++        if self.unsaved:
++            self._save()
++
++
++def _pins_per_page(pins: Any, count: int) -> list[dict[str, Any]]:
++    """Rejig: one ``{item id: cell}`` table per page, empty ones included."""
++    tables = [dict(table or {}) for table in (pins or [])]
++    return tables + [{}] * (count - len(tables))
++
++
+ class MemoryIcons:
+     """Icon store that only lives in memory (demo mode)."""
+ 
+@@ -257,6 +371,8 @@
+         self.view: dict[str, Any] | None = None
+         self.read_file: Path | None = None
+         self.read_at: str | None = None
++        # Rejig: set when a write may have changed the phone and the read after it failed.
++        self.read_stale = False
+         self.device_info: dict[str, Any] | None = None
+         self.last_error: dict[str, Any] | None = None
+         self.job: Job | None = None
+@@ -269,6 +385,9 @@
+         self._own_wallpaper = False
+         self.draft_view: dict[str, Any] | None = None
+         self._backup_details: dict[tuple[str, int, int], Any] = {}
++        self.pins: list[dict[str, Any]] | None = None
++        """Rejig: per page of the last read, the gaps Rejig placed that are still true of it."""
++        self._pin_store = PinStore(settings.data_dir / PINS_FILE)
+ 
+     # ------------------------------------------------------------------ connection
+ 
+@@ -396,8 +515,14 @@
+         self.read_file = saved
+         self.read_at = _now()
+         self.last_error = None
++        udid = (snapshot.get("device") or {}).get("udid")
++        # Rejig: gaps Rejig placed, on the pages that still read back as written.
++        stored = self._pin_store.get(udid) if save else None
++        self.pins = reconcile_pins(stored, snapshot["state"]) if stored else None
++        for page, pins in zip(self.view["pages"], self.pins or []):
++            if pins:
++                page["pins"] = pins
+         if self._fixed_icons is None:
+-            udid = (snapshot.get("device") or {}).get("udid")
+             root = self.settings.cache_root or cache_dir()
+             store = DiskIcons.for_device(udid, root)
+             self.icons = DiskIcons(store.directory)
+@@ -405,6 +530,7 @@
+             if self.wallpaper is None:
+                 # Shown until the phone sends the current one, right after the read.
+                 self.wallpaper = self._wallpapers.get()
++        self.read_stale = False
+         return saved
+ 
+     def _device_key(self) -> str:
+@@ -511,17 +637,38 @@
+         changes = describe_changes(self.view, layout)
+         summary = None
+         same = False
++        approval = None
+         if plan is not None:
+             summary = {k: v for k, v in plan.summary().items() if k != "changes"}
+-            same = same_layout(plan.payload, self.read["state"])
++            count = len(plan.payload["iconLists"])
++            # Rejig: a pin-only edit reads the same but writes differently.
++            same = same_layout(plan.payload, self.read["state"]) and _pins_per_page(
++                plan.payload.get(PINS_KEY), count
++            ) == _pins_per_page(self.pins, count)
++            approval = self.approval(plan)
+         return {
+             "ok": not issues,
+             "issues": issues,
+             "changes": changes,
+             "summary": summary,
+             "dirty": bool(changes) and not same,
++            "approval": approval,
+         }
+ 
++    def approval(self, plan: Plan) -> str:
++        """Rejig: SHA-256 of what Apply would write (pins included) and what it starts from
++        (phone, read, the gaps Rejig placed), so Apply writes only the reviewed changes."""
++        assert self.read is not None
++        target = {k: v for k, v in plan.payload.items() if k != PLAN_META_KEY}
++        body = {
++            "target": target,
++            "removed": sorted(plan.removed),
++            "read": self.read_file.name if self.read_file else "",
++            "phone": self._device_key(),
++            "source_pins": _pins_per_page(self.pins, len(split_state(self.read["state"])[1])),
++        }
++        return hashlib.sha256(plistlib.dumps(body, sort_keys=True)).hexdigest()
++
+     def start_apply(
+         self,
+         layout: Mapping[str, Any],
+@@ -529,13 +676,20 @@
+         *,
+         force: bool = False,
+         expect_read: str | None = None,
++        expect_plan: str | None = None,
+     ) -> Job:
+         self._refuse_in_showcase()
+         self._expect_read(expect_read)
++        self._require_fresh_read()
++        self._pin_store.check_writable()
+         plan, issues = self.plan(layout, remove)
+         if plan is None:
+             raise LayoutProblems(issues)
+         assert self.read is not None
++        if expect_plan is not None and self.approval(plan) != expect_plan:
++            raise PlanChanged(
++                "The layout changed after you reviewed it, so nothing was written. Review the changes and apply again."
++            )
+         # Rejig: an edited layout belongs to the phone it was read from.
+         udid = (self.read.get("device") or {}).get("udid")
+ 
+@@ -551,6 +705,14 @@
+                 "The phone was read again after this was planned; review the current layout first."
+             )
+ 
++    def _require_fresh_read(self) -> None:
++        """Rejig: after a write the read did not follow, the editor's read and gaps are stale."""
++        if self.read_stale:
++            raise ReadChanged(
++                "Rejig could not read the phone after the last write, so nothing was written. "
++                "Use Read from phone first."
++            )
++
+     def _refuse_in_showcase(self) -> None:
+         if self.settings.showcase is not None:
+             raise ShowcaseOnly("showcase mode never writes to the phone")
+@@ -560,6 +722,9 @@
+     ) -> Job:
+         self._refuse_in_showcase()
+         self._expect_read(expect_read)
++        if expect_read is not None:
++            self._require_fresh_read()
++        self._pin_store.check_writable()
+         path = self.backup_path(name)
+         target = api.load_backup(path)
+         if expect_digest is not None and backup_digest(target) != expect_digest:
+@@ -609,25 +774,41 @@
+                 "backup_dir": self.settings.backup_dir,
+                 "timing": self.settings.timing,
+                 "on_event": job.emit,
++                "known_pins": self._pin_store.get(udid),
+             }
+-            if kind == "apply":
+-                result = await api.push(device, target, force=force, **common)
+-            else:
+-                result = await api.restore(device, target, source_fingerprint=approved, **common)
++            try:
++                if kind == "apply":
++                    result = await api.push(device, target, force=force, **common)
++                else:
++                    result = await api.restore(device, target, source_fingerprint=approved, **common)
++            except BaseException:
++                # Rejig: a write that started and did not resolve leaves the gaps unknown.
++                if any(event.get("code") == "writing" for event in job.events):
++                    self.read_stale = True
++                    self._keep_pins(job, udid, None)
++                raise
++            # Rejig: None means the rollback failed too; then the gaps are unknown.
++            self._keep_pins(job, udid, result.pins)
+             outcome = {k: v for k, v in result.to_dict().items() if k != "events"}
+             outcome["backup_name"] = result.backup.name
+             job.emit(Event("rereading", "Reading the home screen again..."))
++            self.read_stale = True  # Rejig: until the read after the write is kept
+             try:
+-                snapshot = await api.read_device(device)
++                self._keep_read(await api.read_device(device))
+             except Exception as exc:
+                 outcome["reread_error"] = friendly(exc)
+             else:
+-                self._keep_read(snapshot)
+                 handed_over = self._fetch_extras(device)
+         finally:
+             if not handed_over:
+                 await device.close()
+         return outcome
++
++    def _keep_pins(self, job: Job, udid: str, record: list[dict[str, Any]] | None) -> None:
++        try:
++            self._pin_store.put(udid, record)
++        except PinStoreError as exc:
++            job.emit(Event("pins_unsaved", str(exc), level=WARNING))
+ 
+     async def shutdown(self) -> None:
+         """Let a running write finish; a half-done write is worse than a slow exit."""
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/app.css b/ios_homescreen/ui/static/app.css
+--- a/ios_homescreen/ui/static/app.css	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/app.css	2026-10-31 13:55:45
+@@ -123,9 +123,18 @@
+ }
+ 
+ button,
+-input {
++input,
++select {
+   font: inherit;
+   color: inherit;
++}
++
++/* Rejig: the spot picker in "Place in a spot". */
++.modal select.field {
++  display: block;
++  margin: 0 0 16px;
++  padding: 6px 8px;
++  border-radius: 8px;
+ }
+ 
+ h2 {
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/actions.js b/ios_homescreen/ui/static/js/actions.js
+--- a/ios_homescreen/ui/static/js/actions.js	2026-10-31 13:31:42
++++ b/ios_homescreen/ui/static/js/actions.js	2026-10-31 14:12:53
+@@ -289,21 +289,35 @@
+     setState({ dialog: { kind: "showcase" }, drawer: null });
+     return;
+   }
+-  setState({ dialog: { kind: "apply" }, drawer: null });
++  // Rejig: freeze what the dialog shows; Apply (and its retries) send exactly this.
++  const review = {
++    draft: state.draft, layout: ops.toLayout(state.draft), remove: [...state.removed],
++    read: state.server?.read?.file, approval: state.check.approval,
++    changes: state.check.changes || [], summary: state.check.summary || {},
++  };
++  setState({ dialog: { kind: "apply" }, review, drawer: null });
+ }
+ 
+ export async function startApply({ force = false } = {}) {
+   const state = getState();
++  const review = state.review;
++  if (!review) return;
+   let job;
+   try {
+     ({ job } = await post("/api/apply", {
+-      layout: ops.toLayout(state.draft), remove: state.removed, force, expect_read: state.server?.read?.file,
++      layout: review.layout, remove: review.remove, force, expect_read: review.read,
++      expect_plan: review.approval,
+     }));
+   } catch (error) {
+     if (error instanceof ApiError && error.data.issues) {
+       setState({ check: { ...state.check, ok: false, issues: error.data.issues }, dialog: null });
+       toast("The layout has problems; see Changes.", { tone: "error" });
+     } else {
++      // Rejig: what Apply would write is not what was reviewed; review it again.
++      if (error instanceof ApiError && ["plan_changed", "read_changed"].includes(error.code)) {
++        setState({ dialog: null });
++        scheduleCheck();
++      }
+       toast(error.message, { tone: "error" });
+     }
+     return;
+@@ -407,7 +421,7 @@
+     }
+     return;
+   }
+-  const draft = ops.insert(base, target.c, target.index, item);
++  const draft = ops.insert(base, target.c, target.index, ops.atTarget(item, target));
+   if (target.c.s === "page") setState({ page: target.c.p });
+   commit(draft);
+ }
+@@ -470,8 +484,22 @@
+   const reason = ops.blockReason(base, item, c);
+   if (reason) return showProblem(reason);
+   const list = ops.getList(base, c);
+-  commit(ops.insert(base, c, list.length, item));
++  commit(ops.insert(base, c, list.length, ops.atTarget(item, null)));
+   if (c.s === "page") setState({ page: c.p });
++  flash(item.id);
++}
++
++// Rejig: pin an item on its page to `cell` (keeping the empty spaces around it), or with
++// cell null let it flow in line again. The keyboard path for what dropping does.
++export function placeAt(item, cell) {
++  const state = getState();
++  const where = ops.locate(state.draft, item.id);
++  if (!where || where.c.s !== "page") return;
++  const list = [...ops.getList(state.draft, where.c)];
++  list[where.i] = ops.atTarget(where.item, cell === null ? null : { cell });
++  commit(ops.setList(state.draft, where.c, list), {
++    label: cell === null ? `${item.name} moves back in line.` : `${item.name} keeps its own spot.`,
++  });
+   flash(item.id);
+ }
+ 
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/dialogs.js b/ios_homescreen/ui/static/js/dialogs.js
+--- a/ios_homescreen/ui/static/js/dialogs.js	2026-10-31 13:31:42
++++ b/ios_homescreen/ui/static/js/dialogs.js	2026-10-31 14:12:53
+@@ -4,7 +4,8 @@
+ import * as actions from "./actions.js";
+ import { html } from "./html.js";
+ import { describeChange, formatDate, issueText, kindName, plural, relativeTime } from "./messages.js";
+-import { REMOVABLE, STUCK, allItems, blockReason, locate, removeId } from "./ops.js";
++import { COLS, PAGE_CELLS, ROWS, pack, pinned } from "./layout.js";
++import { REMOVABLE, STUCK, allItems, blockReason, getList, locate, removeId } from "./ops.js";
+ import { renderCode } from "./phone.js";
+ import { getState, setState, useStore } from "./store.js";
+ 
+@@ -42,12 +43,12 @@
+ 
+ function ApplyDialog() {
+   const state = getState();
+-  const changes = state.check.changes || [];
+-  const summary = state.check.summary || {};
++  // Rejig: the review frozen when the dialog opened, which is what Apply sends.
++  const { changes, summary, draft } = state.review;
+   const device = state.server?.device?.name || "the iPhone";
+   const removed = changes.filter((c) => c.kind === "removed");
+-  const widgets = state.draft && allItems(state.draft).some((item) => item.type === "widget");
+-  const lines = changes.slice(0, 8).map((change) => describeChange(change, state.draft));
++  const widgets = draft && allItems(draft).some((item) => item.type === "widget");
++  const lines = changes.slice(0, 8).map((change) => describeChange(change, draft));
+   return html`<${Modal} title="Apply changes">
+     <h3 class="modal-title">Apply ${plural(changes.length, "change")} to ${device}?</h3>
+     <ul class="apply-lines">
+@@ -74,7 +75,7 @@
+         </div>`
+       : null}
+     <div class="callout">
+-      Empty spaces you left between icons may be lost on any page, including pages you didn't change. iOS doesn't tell Rejig where they are, so it can't keep them.
++      Rejig sends back the empty spaces it placed, as shown here, but iOS can't confirm where icons end up. Empty spaces made on the iPhone itself close on this Apply, on any page: iOS doesn't tell Rejig where they are.
+     </div>
+     <ol class="safety">
+       <li><span>1</span>Backup</li>
+@@ -164,7 +165,7 @@
+         ? html`<button class="btn" onClick=${actions.openBackups}>Open Backups</button>`
+         : null}
+       ${!running && status === "rolled-back"
+-        ? html`<button class="btn" onClick=${() => actions.startApply()}>Try again</button>`
++        ? html`<button class="btn" onClick=${actions.openApply}>Try again</button>`
+         : null}
+       <button class="btn btn-primary" disabled=${running} onClick=${close}>${running ? "Working..." : "Done"}</button>
+     </div>
+@@ -179,7 +180,7 @@
+   const showcase = Boolean(state.server?.showcase);
+   return html`<${Modal} title="Backups" wide>
+     <h3 class="modal-title">Backups</h3>
+-    <p class="modal-text">A backup is saved before every write. Restoring one writes it to the phone with the same checks as Apply (and backs up the current layout first). Empty spaces you left between icons may be lost on any page.</p>
++    <p class="modal-text">A backup is saved before every write. Restoring one writes it to the phone with the same checks as Apply (and backs up the current layout first). A backup keeps the empty spaces Rejig had placed, and Restore sends them back. Older backups, and empty spaces made on the iPhone itself, don't keep them.</p>
+     ${backups === null ? html`<div class="empty"><span class="spinner small"></span> Loading...</div>` : null}
+     ${showcase ? html`<div class="empty">Showcase mode does not list backups and cannot restore them.</div>` : null}
+     ${backups && !backups.length && !showcase ? html`<div class="empty">No backups yet. One is made before every Apply.</div>` : null}
+@@ -221,6 +222,35 @@
+   <//>`;
+ }
+ 
++// Rejig: the keyboard way to give an app its own spot: pick a free cell on its page.
++function PlaceDialog() {
++  const { item } = getState().dialog;
++  const where = locate(getState().draft, item.id);
++  const others = where ? getList(getState().draft, where.c).filter((x) => x.id !== item.id) : [];
++  const covered = new Set(pack(others).flatMap((p) => Array.from({ length: p.w * p.h }, (_, k) => (p.row + Math.floor(k / p.w)) * COLS + p.col + (k % p.w))));
++  const free = Array.from({ length: PAGE_CELLS }, (_, cell) => cell).filter(
++    (cell) => !covered.has(cell) && pack([...others, { ...item, cell }]).every((p) => p.row + p.h <= ROWS),
++  );
++  const [cell, setCell] = useState(pinned(item) ? item.cell : free[0]);
++  const place = () => {
++    close();
++    actions.placeAt(item, Number(cell));
++  };
++  return html`<${Modal} title="Place in a spot">
++    <h3 class="modal-title">Where should ${item.name} go on page ${where ? where.c.p + 1 : "?"}?</h3>
++    <p class="modal-text">It keeps that spot, with empty spaces around it. The other icons fill the free spots in order.</p>
++    ${free.length
++      ? html`<select class="field" data-autofocus aria-label="Spot" value=${cell} onChange=${(e) => setCell(Number(e.target.value))}>
++          ${free.map((c) => html`<option value=${c}>Row ${Math.floor(c / COLS) + 1}, column ${(c % COLS) + 1}</option>`)}
++        </select>`
++      : html`<p class="modal-text">This page has no free spot for it.</p>`}
++    <div class="modal-actions">
++      <button class="btn" onClick=${close}>Cancel</button>
++      <button class="btn btn-commit" disabled=${!free.length} onClick=${place}>Place</button>
++    </div>
++  <//>`;
++}
++
+ function ConfirmRead() {
+   return html`<${Modal} title="Read from phone">
+     <h3 class="modal-title">Discard your edits and read the phone again?</h3>
+@@ -282,6 +312,7 @@
+   if (kind === "job") return html`<${JobDialog} />`;
+   if (kind === "backups") return html`<${BackupsDialog} />`;
+   if (kind === "confirm-remove") return html`<${ConfirmRemove} />`;
++  if (kind === "place") return html`<${PlaceDialog} />`;
+   if (kind === "confirm-read") return html`<${ConfirmRead} />`;
+   if (kind === "confirm-import") return html`<${ConfirmImport} />`;
+   if (kind === "import-issues") return html`<${ImportIssues} />`;
+@@ -323,6 +354,10 @@
+   });
+   if (!inFolder && item.type !== "folder" && item.type !== "widget") {
+     entries.push({ label: "Put in a new folder", run: () => actions.intoNewFolder(item) });
++  }
++  if (where.c.s === "page" && item.type !== "folder" && item.type !== "widget") {
++    entries.push({ label: "Place in a spot...", run: () => setState({ dialog: { kind: "place", item }, menu: null }) });
++    if (pinned(item)) entries.push({ label: "Move back in line", run: () => actions.placeAt(item, null) });
+   }
+   entries.push({ separator: true });
+   if (item.type === "app") entries.push({ label: "Move to App Library", run: () => actions.sendAway(item) });
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/drag.js b/ios_homescreen/ui/static/js/drag.js
+--- a/ios_homescreen/ui/static/js/drag.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/drag.js	2026-10-31 13:55:13
+@@ -8,7 +8,7 @@
+ // drop target changes, and the phone renders the preview from it (preview.js).
+ 
+ import * as L from "./layout.js";
+-import { STUCK, blockReason, canMerge, getList } from "./ops.js";
++import { STUCK, atTarget, blockReason, canMerge, getList } from "./ops.js";
+ import { refusalShort } from "./messages.js";
+ import { baseFor } from "./preview.js";
+ import { getState, setState } from "./store.js";
+@@ -151,6 +151,7 @@
+     a.zone === b.zone &&
+     sameContainer(a.c, b.c) &&
+     a.index === b.index &&
++    a.cell === b.cell &&
+     a.targetId === b.targetId &&
+     (a.invalid?.code || null) === (b.invalid?.code || null)
+   );
+@@ -304,14 +305,18 @@
+   const c = { s: "page", p: state.page };
+   const others = base.pages[state.page] || [];
+   const current = currentIndex(c);
+-  const shown = current == null ? others : [...others.slice(0, current), { ...drag.item, ghost: true }, ...others.slice(current)];
++  const ghost = atTarget({ ...drag.item, ghost: true }, drag.target);
++  const shown = current == null ? others : [...others.slice(0, current), ghost, ...others.slice(current)];
+   const positions = L.pack(shown);
+   const delay = mergeOrHold(shown, positions.map(L.cellBox), c, px, py, current);
+   if (delay === null) return;
+   const reason = blockReason(base, drag.item, c);
+   if (reason) return setTarget({ zone: "page", c, invalid: reason });
+-  const index = L.bestPageIndex(others, drag.item, gx, gy, current);
+-  propose({ zone: "page", c, index }, delay);
++  // Rejig: scored as flowing; dropped on an empty cell off the flow, it is pinned there.
++  const free = atTarget(drag.item, null);
++  const index = L.bestPageIndex(others, free, gx, gy, current);
++  const cell = L.pinCell(others, free, gx, gy, index);
++  propose(cell === null ? { zone: "page", c, index } : { zone: "page", c, index, cell }, delay);
+ }
+ 
+ function dockTarget(state, px, py) {
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/layout.js b/ios_homescreen/ui/static/js/layout.js
+--- a/ios_homescreen/ui/static/js/layout.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/layout.js	2026-10-31 13:54:21
+@@ -86,8 +86,35 @@
+   return placed;
+ }
+ 
++// Rejig: an app, web clip or web app placed on its own cell (item.cell, 0-23), with
++// empty spaces kept around it. Widgets and folders cannot be pinned.
++export function pinned(item) {
++  return Number.isInteger(item.cell) && item.cell >= 0 && item.cell < PAGE_CELLS && item.type !== "widget" && item.type !== "folder";
++}
++
++// Rejig: a page with pins, the way the server's place_page writes it: pinned items take
++// their cells, the rest fill the first free cell that fits, row by row, in list order.
++// Items that do not fit go below the grid (the server reports the page as invalid).
++function placePinned(items) {
++  const grid = [];
++  for (const item of items) if (pinned(item)) mark(grid, Math.floor(item.cell / COLS), item.cell % COLS, 1, 1, true);
++  return items.map((item) => {
++    if (pinned(item)) return { col: item.cell % COLS, row: Math.floor(item.cell / COLS), w: 1, h: 1 };
++    const [w, h] = span(item);
++    for (let at = 0; ; at++) {
++      const row = Math.floor(at / COLS);
++      const col = at % COLS;
++      if (fits(grid, row, col, w, h)) {
++        mark(grid, row, col, w, h, true);
++        return { col, row, w, h };
++      }
++    }
++  });
++}
++
+ // Grid positions ({col, row, w, h}) for the items of one page.
+ export function pack(items) {
++  if (items.some(pinned)) return placePinned(items);
+   const sparse = place(items, false);
+   const rows = Math.max(0, ...sparse.map((p) => p.row + p.h));
+   if (rows <= ROWS) return sparse;
+@@ -144,6 +171,31 @@
+     if (better) best = { k, score };
+   }
+   return best ? best.k : others.length;
++}
++
++// Rejig: the empty cell under a dragged app (top-left at x, y) when dropping it there
++// leaves a gap that flowing it in at `index` would not; null otherwise (flow, unpinned).
++export function pinCell(others, item, x, y, index) {
++  if (item.type === "widget" || item.type === "folder") return null;
++  const col = Math.max(0, Math.min(COLS - 1, Math.round((x - GRID_LEFT) / PITCH_X)));
++  const row = Math.max(0, Math.round((y - GRID_TOP) / PITCH_Y));
++  const cell = row * COLS + col;
++  if (row >= ROWS || pack(others).some((p) => col >= p.col && col < p.col + p.w && row >= p.row && row < p.row + p.h)) return null;
++  const free = { ...item, cell: undefined };
++  const flowed = pack([...others.slice(0, index), free, ...others.slice(index)])[index];
++  if (flowed.row * COLS + flowed.col === cell) return null;
++  // Only when everything still fits around it.
++  const placed = pack([...others, { ...item, cell }]);
++  return placed.every((p) => p.row + p.h <= ROWS) ? cell : null;
++}
++
++// Rejig: a page's items in screen order and its pins, as the server takes them.
++export function pageLayout(items) {
++  if (!items.some(pinned)) return { items };
++  const at = pack(items).map((p) => p.row * COLS + p.col);
++  const order = items.map((_, i) => i).sort((a, b) => at[a] - at[b]);
++  const pins = Object.fromEntries(items.filter(pinned).map((item) => [item.id, item.cell]));
++  return { items: order.map((i) => items[i]), pins };
+ }
+ 
+ export function bestDockIndex(count, x) {
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/main.js b/ios_homescreen/ui/static/js/main.js
+--- a/ios_homescreen/ui/static/js/main.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/main.js	2026-10-31 14:12:53
+@@ -95,7 +95,8 @@
+     actions.boot();
+     const key = (event) => {
+       const s = getState();
+-      if (isTyping(event) || s.drag) return;
++      // Rejig: no edits behind an open dialog, so Apply's review cannot change under it.
++      if (isTyping(event) || s.drag || s.dialog || s.menu) return;
+       const mod = event.ctrlKey || event.metaKey;
+       if (mod && event.key.toLowerCase() === "z" && !event.shiftKey) {
+         event.preventDefault();
+@@ -103,8 +104,6 @@
+       } else if (mod && (event.key.toLowerCase() === "y" || (event.key.toLowerCase() === "z" && event.shiftKey))) {
+         event.preventDefault();
+         actions.redo();
+-      } else if (s.dialog || s.menu) {
+-        return;
+       } else if (event.key === "Escape") {
+         if (s.openFolder) actions.closeFolder();
+         else if (s.drawer) setState({ drawer: null });
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/messages.js b/ios_homescreen/ui/static/js/messages.js
+--- a/ios_homescreen/ui/static/js/messages.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/messages.js	2026-10-31 13:55:08
+@@ -129,6 +129,10 @@
+       return { title: name, detail: "Folder removed", tone: "library" };
+     case "pages":
+       return { title: "Pages", detail: `${change.before} pages become ${change.after}`, tone: "move" };
++    case "pinned":
++      return { title: name, detail: `Keeps its own spot: ${to()}`, tone: "move" };
++    case "unpinned":
++      return { title: name, detail: `Moves back in line on page ${change.from?.page ?? "?"}`, tone: "move" };
+     default:
+       return { title: name, detail: change.kind, tone: "move" };
+   }
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/ops.js b/ios_homescreen/ui/static/js/ops.js
+--- a/ios_homescreen/ui/static/js/ops.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/ops.js	2026-10-31 13:54:21
+@@ -4,7 +4,7 @@
+ //
+ // A place ("container") is { s: "dock" } | { s: "page", p } | { s: "folder", fid, fp }.
+ 
+-import { DOCK_SLOTS, FOLDER_SLOTS, PAGE_CELLS, cells, pageCells } from "./layout.js";
++import { DOCK_SLOTS, FOLDER_SLOTS, PAGE_CELLS, cells, pageCells, pageLayout, pinned } from "./layout.js";
+ 
+ export const FOLDABLE = new Set(["app", "webclip", "webapp"]);
+ // Widgets can be removed, after a confirmation; they cannot be put back from here.
+@@ -21,14 +21,25 @@
+ export function fromView(view) {
+   return {
+     dock: [...(view.dock || [])],
+-    pages: (view.pages || []).map((page) => [...(Array.isArray(page) ? page : page.items || [])]),
++    pages: (view.pages || []).map((page) => {
++      const items = [...(Array.isArray(page) ? page : page.items || [])];
++      // Rejig: gaps Rejig placed; each pinned item carries its cell.
++      const pins = Array.isArray(page) ? null : page.pins;
++      return pins ? items.map((item) => (item.id in pins ? { ...item, cell: pins[item.id] } : item)) : items;
++    }),
+   };
+ }
+ 
+ export function toLayout(draft) {
+-  return { dock: draft.dock, pages: draft.pages.map((items) => ({ items })) };
++  return { dock: draft.dock, pages: draft.pages.map(pageLayout) };
+ }
+ 
++// Rejig: the item as dropped on `target`: pinned to its cell, or flowing (unpinned).
++export function atTarget(item, target) {
++  const { cell, ...free } = item;
++  return target && Number.isInteger(target.cell) ? { ...free, cell: target.cell } : free;
++}
++
+ function topLevel(draft) {
+   return [
+     ...draft.dock.map((item, i) => ({ item, s: "dock", i })),
+@@ -124,8 +135,14 @@
+     if (!pages.length && item.id !== keep) return null;
+     return { ...item, pages: pages.length ? pages : [[]] };
+   };
++  // Rejig: only items on a page keep a pin (not in the dock or inside a folder).
++  const unpin = (item) => (item.cell === undefined ? item : atTarget(item, null));
+   const clean = (list) => list.map(tidy).filter(Boolean);
+-  return { dock: clean(draft.dock), pages: draft.pages.map(clean) };
++  const inner = (item) => (item.type === "folder" ? { ...item, pages: item.pages.map((page) => page.map(unpin)) } : item);
++  return {
++    dock: clean(draft.dock).map((item) => inner(unpin(item))),
++    pages: draft.pages.map((page) => clean(page).map((item) => inner(pinned(item) ? item : unpin(item)))),
++  };
+ }
+ 
+ export function canMerge(item, target) {
+diff -ruN -x __pycache__ a/ios_homescreen/ui/static/js/preview.js b/ios_homescreen/ui/static/js/preview.js
+--- a/ios_homescreen/ui/static/js/preview.js	2026-10-31 13:31:41
++++ b/ios_homescreen/ui/static/js/preview.js	2026-10-31 13:55:08
+@@ -1,7 +1,7 @@
+ // What the phone shows while something is being dragged. The drag controller and the
+ // drop use the same functions, so what you see is what you get.
+ 
+-import { insert, removeId, tidyFolders } from "./ops.js";
++import { atTarget, insert, removeId, tidyFolders } from "./ops.js";
+ 
+ // The draft without the dragged item (folders tidied, the open one kept).
+ export function baseFor(state) {
+@@ -20,6 +20,6 @@
+   if (!target || target.invalid || target.zone === "library") return { draft: base, highlight: null };
+   if (target.zone === "merge") return { draft: base, highlight: target.targetId };
+   const keep = openFolder ? openFolder.id : null;
+-  const placed = insert(base, target.c, target.index, { ...drag.item, ghost: true });
++  const placed = insert(base, target.c, target.index, atTarget({ ...drag.item, ghost: true }, target));
+   return { draft: tidyFolders(placed, keep), highlight: null };
+ }
+diff -ruN -x __pycache__ a/ios_homescreen/workflow.py b/ios_homescreen/workflow.py
+--- a/ios_homescreen/workflow.py
++++ b/ios_homescreen/workflow.py
+@@ -14,9 +14,12 @@
+     PINS_KEY,
+     PLAN_META_KEY,
+     fingerprint,
++    pin_record,
++    reconcile_pins,
+     safe_payload,
+     same_layout,
+     save_plist,
++    to_payload,
+     wire_payload,
+ )
+ 
+@@ -59,6 +62,9 @@
+     write_unconfirmed: bool
+     rollback_verified: bool
+     events: tuple[Event, ...] = field(default=())
++    pins: list[dict[str, Any]] | None = None
++    """Rejig: the gaps now on the phone, as a :func:`~.state.pin_record` of the read that
++    verified the write; ``None`` when that is unknown (the rollback failed too)."""
+ 
+     @property
+     def ok(self) -> bool:
+@@ -81,7 +87,8 @@
+         raise WorkflowError(f"{what} did not finish within {seconds:g} s", code="timeout") from exc
+ 
+ 
+-async def _verify(device: HomeScreen, target: Any, timing: Timing) -> bool:
++async def _verify(device: HomeScreen, target: Any, timing: Timing) -> Any:
++    """The read that shows ``target`` (Rejig: so pins bind to it), or ``None``."""
+     attempts = max(1, timing.verify_attempts)
+     for attempt in range(attempts):
+         if attempt > 0 and timing.verify_interval:
+@@ -93,8 +100,8 @@
+             # without proof the caller rolls back.
+             continue
+         if same_layout(current, target):
+-            return True
+-    return False
++            return current
++    return None
+ 
+ 
+ async def _write(device: HomeScreen, payload: dict[str, Any], seconds: float) -> bool:
+@@ -118,12 +125,17 @@
+     force: bool = False,
+     timing: Timing | None = None,
+     on_event: EventSink = ignore,
++    known_pins: Any = None,
+ ) -> ApplyResult:
+     """Back up, write ``target`` safely, prove it by re-reading, roll back if needed.
+ 
+     ``target`` is a plan payload (with a source fingerprint) or a plain state to restore.
+     The backup records the layout as read and the device's ``info`` when it has one.
+     Raises :class:`WorkflowError` before anything is written if a precondition fails.
++
++    Rejig: ``known_pins`` is the :func:`~.state.pin_record` of gaps Rejig placed earlier.
++    The pins still true of the current layout go into the backup and back out with a
++    rollback, which would otherwise close every gap.
+     """
+     timing = timing or Timing()
+     events: list[Event] = []
+@@ -139,9 +151,10 @@
+     installed = await _timed(
+         device.installed_apps(), timing.read_timeout, "Reading the installed apps"
+     )
++    pins_now = reconcile_pins(known_pins, current) if known_pins else None
+     backup = save_plist(
+         Path(backup_dir) / f"backup-{timestamp()}.plist",
+-        make_backup(current, device=getattr(device, "info", None)),
++        make_backup(current, device=getattr(device, "info", None), pins=pins_now),
+     )
+     emit("backup_saved", f"Backup: {backup}", path=backup)
+ 
+@@ -172,7 +185,8 @@
+         )
+ 
+     emit("verifying", "Re-reading the layout to verify it...", 4)
+-    if await _verify(device, payload, timing):
++    verified = await _verify(device, payload, timing)
++    if verified is not None:
+         emit("verified", "Layout verified.", 5)
+         if payload.get(PINS_KEY):
+             emit(
+@@ -181,23 +195,39 @@
+                 "could not be checked.",
+                 level=WARNING,
+             )
+-        return ApplyResult(APPLIED, backup, unconfirmed, False, tuple(events))
++        return ApplyResult(
++            APPLIED,
++            backup,
++            unconfirmed,
++            False,
++            tuple(events),
++            pin_record(verified, payload.get(PINS_KEY)),
++        )
+ 
+     emit(
+         "rolling_back",
+         "The new layout could not be verified. Rolling back to the backup...",
+         level=WARNING,
+     )
+-    rollback = safe_payload(current, installed)
+-    rollback_unconfirmed = await _write(device, rollback, timing.write_timeout)
+-    if await _verify(device, rollback, timing):
++    rollback_target = to_payload(current)
++    if pins_now:
++        rollback_target[PINS_KEY] = pins_now
++    rollback = safe_payload(rollback_target, installed)
++    rollback_unconfirmed = await _write(device, wire_payload(rollback), timing.write_timeout)
++    verified = await _verify(device, rollback, timing)
++    if verified is not None:
+         emit(
+             "rolled_back",
+             "Rollback written and verified. The device is back to its previous layout.",
+             level=WARNING,
+         )
+         return ApplyResult(
+-            ROLLED_BACK, backup, unconfirmed or rollback_unconfirmed, True, tuple(events)
++            ROLLED_BACK,
++            backup,
++            unconfirmed or rollback_unconfirmed,
++            True,
++            tuple(events),
++            pin_record(verified, rollback.get(PINS_KEY)),
+         )
+     emit(
+         "rollback_failed",

@@ -1,0 +1,380 @@
+Rejig: send gap pins with a layout write so icons placed with empty spaces around them stay
+there. Applies to ios_homescreen/state.py, planner.py, model.py and workflow.py from
+https://github.com/YakupEmreYerli/ios-homescreen at commit
+97649547dbc44295e451c6bf130a87404481e10c, after Rejig's other patches. A layout page may
+carry "pins" ({app or web clip id: grid cell 0-23}). The plan keeps them, puts a pinned
+page in screen order (SpringBoard reads it back that way), and the write sends them as
+listUniqueIdentifiers plus listMetadata fixedLocations, the keys SpringBoard keeps gaps in.
+Readback cannot see pins, so a verified write with pins warns that the spots went unchecked.
+Pages without pins are sent exactly as before. Method from homescreen-mcp
+(https://github.com/kats1123/homescreen-mcp, MIT, Copyright (c) 2026 Jonathan Kats);
+checked on the iOS 26.5 simulator. ios-homescreen is MIT-licensed, Copyright (c) 2026 Yakup
+Emre Yerli (full notice in THIRD_PARTY_NOTICES.md). This patch is MIT.
+
+diff -ruN -x __pycache__ -x dialogs.js a/ios_homescreen/model.py b/ios_homescreen/model.py
+--- a/ios_homescreen/model.py
++++ b/ios_homescreen/model.py
+@@ -209,10 +209,16 @@
+     return {
+         "dock": {"items": [_entry(x) for x in layout.get("dock", []) or []]},
+         "pages": [
+-            {"items": [_entry(x) for x in _page_items(page) or []]}
+-            for page in (pages if isinstance(pages, list) else [])
++            _page_document(page) for page in (pages if isinstance(pages, list) else [])
+         ],
+     }
++
++
++def _page_document(page: Any) -> dict[str, Any]:
++    out: dict[str, Any] = {"items": [_entry(x) for x in _page_items(page) or []]}
++    if isinstance(page, Mapping) and "pins" in page:
++        out["pins"] = page["pins"]  # {item id: grid cell}; the planner checks it
++    return out
+ 
+ 
+ def _folders(view: Mapping[str, Any]) -> list[dict[str, Any]]:
+diff -ruN -x __pycache__ -x dialogs.js a/ios_homescreen/planner.py b/ios_homescreen/planner.py
+--- a/ios_homescreen/planner.py
++++ b/ios_homescreen/planner.py
+@@ -27,6 +27,7 @@
+     DOCK_SLOTS,
+     PAGE_CELLS,
+     PLAN_FORMAT_VERSION,
++    PINS_KEY,
+     PLAN_META_KEY,
+     StateError,
+     fingerprint,
+@@ -37,6 +38,7 @@
+     item_kind,
+     iter_items,
+     page_usage,
++    place_page,
+     safe_payload,
+     visible_apps,
+ )
+@@ -297,10 +299,10 @@
+         raise _fail("invalid_toml", f"invalid TOML: {exc}") from exc
+ 
+ 
+-def _items_list(table: Any, where: Location) -> list[Any]:
++def _items_list(table: Any, where: Location, *, allow_pins: bool = False) -> list[Any]:
+     if not isinstance(table, Mapping):
+         raise _fail("bad_structure", "must be a table", where)
+-    unknown = sorted(set(table) - {"items"})
++    unknown = sorted(set(table) - ({"items", "pins"} if allow_pins else {"items"}))
+     if unknown:
+         raise _fail("unknown_key", f"unknown key(s) {', '.join(unknown)}", where, keys=unknown)
+     items = table.get("items", [])
+@@ -532,9 +534,20 @@
+     if not isinstance(page_tables, list):
+         raise _fail("bad_structure", "pages must be an array of tables ([[pages]])")
+     pages: list[list[Any]] = []
++    page_pins: list[dict[str, Any]] = []
+     for page_no, table in enumerate(page_tables, 1):
+         where = Location("page", page_no)
+-        page = planner.section(_items_list(table, where), where)
++        page = planner.section(_items_list(table, where, allow_pins=True), where)
++        pins = table.get("pins", {})
++        if not isinstance(pins, Mapping) or any(not isinstance(k, str) for k in pins):
++            planner.collect(_fail("invalid_pins", "pins must be a table of item id = cell", where))
++            pins = {}
++        elif pins:
++            try:
++                place_page(page, pins)
++            except StateError as exc:
++                planner.collect(_fail("invalid_pins", str(exc), where))
++        page_pins.append(dict(pins))
+         used = page_usage(page)
+         if used > PAGE_CELLS:
+             planner.collect(
+@@ -550,6 +563,8 @@
+     planner.issues.extend(_check_duplicates(dock, pages))
+ 
+     draft = {"buttonBar": dock, "iconLists": pages, "ignored": []}
++    if any(page_pins):
++        draft[PINS_KEY] = page_pins
+     source_state = read["state"]
+     before_specials, after_specials = _specials(source_state), _specials(draft)
+     missing = {i: x for i, x in sorted(before_specials.items()) if i not in after_specials}
+diff -ruN -x __pycache__ -x dialogs.js a/ios_homescreen/state.py b/ios_homescreen/state.py
+--- a/ios_homescreen/state.py
++++ b/ios_homescreen/state.py
+@@ -12,6 +12,7 @@
+ import plistlib
+ from collections.abc import Iterable, Iterator, Mapping
+ from copy import deepcopy
++import uuid
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -27,6 +28,16 @@
+ 
+ PAYLOAD_KEYS = frozenset({"buttonBar", "iconLists", "ignored"})
+ 
++PINS_KEY = "pins"
++"""Optional plan key: per page, ``{item id: grid cell}`` for items placed with gaps around them."""
++
++WIRE_PIN_KEYS = frozenset({"listUniqueIdentifiers", "listMetadata"})
++"""How SpringBoard takes those pins in ``setIconState``; reads never return them."""
++
++GRID_COLUMNS, GRID_ROWS = 4, 6
++
++WIDGET_SHAPES = {"small": (2, 2), "medium": (4, 2), "large": (4, 4), "extraLarge": (4, 4)}
++
+ HOME_SCREEN_APP_TYPES = frozenset({"User", "System"})
+ 
+ 
+@@ -169,6 +180,136 @@
+         raise StateError(f"unknown widget size: {size!r}") from exc
+ 
+ 
++# --------------------------------------------------------------------------- pins (gaps)
++
++
++def item_shape(item: Any) -> tuple[int, int]:
++    """(columns, rows) an item covers on the 4x6 grid."""
++    if not is_widget(item):
++        return (1, 1)
++    size = str(item.get("gridSize", "small"))
++    try:
++        return WIDGET_SHAPES[size]
++    except KeyError as exc:
++        raise StateError(f"unknown widget size: {size!r}") from exc
++
++
++def _footprint(cell: int, shape: tuple[int, int]) -> set[int] | None:
++    row, col = divmod(cell, GRID_COLUMNS)
++    width, height = shape
++    if col + width > GRID_COLUMNS or row + height > GRID_ROWS:
++        return None
++    return {(row + r) * GRID_COLUMNS + col + c for r in range(height) for c in range(width)}
++
++
++def _pin_error(message: str) -> StateError:
++    return StateError(message, code="invalid_pins")
++
++
++def place_page(page: list[Any], pins: Mapping[str, Any] | None) -> list[tuple[int, Any]]:
++    """``(cell, item)`` for every item on a page, in screen order.
++
++    Pinned items take their cells; the rest fill the first free cell that fits, row by
++    row, in list order. Only apps and web clips can be pinned (folders have no device
++    id; which id a widget's pin uses is unverified). SpringBoard reads a pinned page back
++    in screen order, so a write must send it in that order or readback fails.
++    """
++    pins = dict(pins or {})
++    taken: set[int] = set()
++    placed: list[tuple[int, Any]] = []
++    pinnable = {}
++    for item in page:
++        if not is_folder(item) and not is_widget(item):
++            pinnable.setdefault(item_id(item), item)
++    unknown = sorted(set(pins) - set(pinnable))
++    if unknown:
++        raise _pin_error("pinned items must be apps or web clips on that page: " + ", ".join(unknown))
++    for ident, cell in pins.items():
++        if isinstance(cell, bool) or not isinstance(cell, int) or not 0 <= cell < PAGE_CELLS:
++            raise _pin_error(f"pin cell for {ident} must be 0-{PAGE_CELLS - 1}, got {cell!r}")
++        if cell in taken:
++            raise _pin_error(f"two items are pinned to cell {cell}")
++        taken.add(cell)
++    pinned_items = {id(pinnable[ident]): cell for ident, cell in pins.items()}
++    for item in page:
++        cell = pinned_items.get(id(item))
++        if cell is not None:
++            placed.append((cell, item))
++            continue
++        shape = item_shape(item)
++        for candidate in range(PAGE_CELLS):
++            cells = _footprint(candidate, shape)
++            if cells is not None and not cells & taken:
++                taken |= cells
++                placed.append((candidate, item))
++                break
++        else:
++            raise _pin_error(f"{item_name(item)} does not fit around the pinned items")
++    return sorted(placed, key=lambda pair: pair[0])
++
++
++def _page_pins(state: Mapping[str, Any], pages: list[list[Any]]) -> list[dict[str, int]] | None:
++    raw = state.get(PINS_KEY)
++    if raw is None:
++        return None
++    if not isinstance(raw, list) or len(raw) != len(pages):
++        raise _pin_error("pins must be a list with one table per page")
++    if any(not isinstance(p, Mapping) or any(not isinstance(k, str) for k in p) for p in raw):
++        raise _pin_error("each page's pins must map item ids to cells")
++    return [dict(p) for p in raw]
++
++
++def wire_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
++    """The ``setIconState`` dictionary: pins become fresh page ids plus ``listMetadata``."""
++    out = {key: payload[key] for key in PAYLOAD_KEYS}
++    pins = payload.get(PINS_KEY)
++    if pins and any(pins):
++        ids = [str(uuid.uuid4()).upper() for _ in out["iconLists"]]
++        out["listUniqueIdentifiers"] = ids
++        out["listMetadata"] = {
++            ids[i]: {
++                "fixedLocations": dict(page_pins),
++                "fixedLocationsGridColumns": GRID_COLUMNS,
++                "fixedLocationsGridRows": GRID_ROWS,
++            }
++            for i, page_pins in enumerate(pins)
++            if page_pins
++        }
++    return out
++
++
++_METADATA_FIELDS = frozenset({"fixedLocations", "fixedLocationsGridColumns", "fixedLocationsGridRows"})
++
++
++def _check_wire_pins(payload: Mapping[str, Any]) -> None:
++    if not WIRE_PIN_KEYS & set(payload):
++        return
++    ids, meta = payload.get("listUniqueIdentifiers"), payload.get("listMetadata")
++    pages = payload["iconLists"]
++    if (
++        not isinstance(ids, list)
++        or len(ids) != len(pages)
++        or any(not isinstance(i, str) or not i for i in ids)
++        or len(set(ids)) != len(ids)
++    ):
++        raise _pin_error("listUniqueIdentifiers must hold one distinct id string per page")
++    if not isinstance(meta, Mapping) or not meta or not set(meta) <= set(ids):
++        raise _pin_error("listMetadata must be keyed by page ids")
++    for page_id, entry in meta.items():
++        if not isinstance(entry, Mapping) or set(entry) != _METADATA_FIELDS:
++            raise _pin_error("listMetadata entries hold exactly fixedLocations and the grid size")
++        size = (entry["fixedLocationsGridColumns"], entry["fixedLocationsGridRows"])
++        if any(isinstance(n, bool) for n in size) or size != (GRID_COLUMNS, GRID_ROWS):
++            raise _pin_error(f"pins are only supported on the {GRID_COLUMNS}x{GRID_ROWS} grid")
++        locations = entry["fixedLocations"]
++        if not isinstance(locations, Mapping) or not locations or any(not isinstance(k, str) for k in locations):
++            raise _pin_error("fixedLocations must map item ids to cells")
++        page = pages[ids.index(page_id)]
++        placed = place_page(page, locations)
++        if [item for _, item in placed] != list(page):
++            raise _pin_error("a pinned page must be sent in screen order")
++
++
+ # --------------------------------------------------------------------------- state shape
+ 
+ 
+@@ -187,11 +328,14 @@
+         dock, pages = split_state(state)
+         return {"buttonBar": deepcopy(dock), "iconLists": deepcopy(pages), "ignored": []}
+     if isinstance(state, dict):
+-        return {
++        payload = {
+             "buttonBar": deepcopy(state.get("buttonBar", [])),
+             "iconLists": deepcopy(state.get("iconLists", [])),
+             "ignored": deepcopy(state.get("ignored", [])),
+         }
++        if state.get(PINS_KEY) is not None:
++            payload[PINS_KEY] = deepcopy(state[PINS_KEY])
++        return payload
+     raise StateError(f"unexpected icon state type: {type(state).__name__}")
+ 
+ 
+@@ -282,6 +426,17 @@
+     payload["iconLists"] = [
+         [normalize_for_write(item) for item in page] for page in payload["iconLists"]
+     ]
++    pins = _page_pins(payload, payload["iconLists"])
++    if pins is not None:
++        # Pages without pins keep their order exactly; pinned pages go in screen order.
++        payload["iconLists"] = [
++            [item for _, item in place_page(page, page_pins)] if page_pins else page
++            for page, page_pins in zip(payload["iconLists"], pins)
++        ]
++        if any(pins):
++            payload[PINS_KEY] = pins
++        else:
++            del payload[PINS_KEY]
+     shown = visible_apps(payload)
+     payload["ignored"] = sorted(
+         ident
+@@ -421,9 +576,10 @@
+     """Check that ``apply`` input is a planner-made, structurally sound payload."""
+     if not isinstance(plan, dict):
+         raise StateError("a plan must be a dictionary")
+-    if set(plan) != {*PAYLOAD_KEYS, PLAN_META_KEY}:
++    if not {*PAYLOAD_KEYS, PLAN_META_KEY} <= set(plan) <= {*PAYLOAD_KEYS, PLAN_META_KEY, PINS_KEY}:
+         raise StateError(
+             f"a plan must contain exactly buttonBar, iconLists, ignored and {PLAN_META_KEY}"
++            f" (and optionally {PINS_KEY})"
+         )
+     meta = plan[PLAN_META_KEY]
+     if not isinstance(meta, Mapping) or meta.get("version") != PLAN_FORMAT_VERSION:
+@@ -437,6 +593,10 @@
+         raise StateError("the plan's source fingerprint is missing or invalid")
+     _check_sections(plan["buttonBar"], plan["iconLists"], plan["ignored"])
+     _check_no_overlap(plan)
++    pins = _page_pins(plan, plan["iconLists"])
++    for page, page_pins in zip(plan["iconLists"], pins or []):
++        if page_pins:  # pin-less pages keep the planner's cell-count check only
++            place_page(page, page_pins)
+ 
+ 
+ def validate_backup(state: Any) -> None:
+@@ -462,10 +622,14 @@
+     """Gatekeeper for the device boundary: only the full safe dictionary may pass."""
+     if not isinstance(payload, dict):
+         raise StateError("the write payload must be the safe dictionary, not a list")
+-    if set(payload) != PAYLOAD_KEYS:
+-        raise StateError("the write payload must contain exactly buttonBar, iconLists and ignored")
++    if not PAYLOAD_KEYS <= set(payload) <= PAYLOAD_KEYS | WIRE_PIN_KEYS:
++        raise StateError(
++            "the write payload must contain exactly buttonBar, iconLists and ignored"
++            " (and optionally listUniqueIdentifiers with listMetadata)"
++        )
+     _check_sections(payload["buttonBar"], payload["iconLists"], payload["ignored"], for_write=True)
+     _check_no_overlap(payload)
++    _check_wire_pins(payload)
+ 
+ 
+ def page_usage(page: Iterable[Any]) -> int:
+diff -ruN -x __pycache__ -x dialogs.js a/ios_homescreen/workflow.py b/ios_homescreen/workflow.py
+--- a/ios_homescreen/workflow.py
++++ b/ios_homescreen/workflow.py
+@@ -10,7 +10,15 @@
+ 
+ from .events import ERROR, WARNING, Event, EventSink, ignore
+ from .snapshots import make_backup, timestamp
+-from .state import PLAN_META_KEY, fingerprint, safe_payload, same_layout, save_plist
++from .state import (
++    PINS_KEY,
++    PLAN_META_KEY,
++    fingerprint,
++    safe_payload,
++    same_layout,
++    save_plist,
++    wire_payload,
++)
+ 
+ APPLIED = "applied"
+ ROLLED_BACK = "rolled-back"
+@@ -155,7 +163,7 @@
+         3,
+         ignored=ignored,
+     )
+-    unconfirmed = await _write(device, payload, timing.write_timeout)
++    unconfirmed = await _write(device, wire_payload(payload), timing.write_timeout)
+     if unconfirmed:
+         emit(
+             "write_unconfirmed",
+@@ -166,6 +174,13 @@
+     emit("verifying", "Re-reading the layout to verify it...", 4)
+     if await _verify(device, payload, timing):
+         emit("verified", "Layout verified.", 5)
++        if payload.get(PINS_KEY):
++            emit(
++                "pins_unverified",
++                "Icon order verified. iOS does not report empty spaces, so the pinned spots "
++                "could not be checked.",
++                level=WARNING,
++            )
+         return ApplyResult(APPLIED, backup, unconfirmed, False, tuple(events))
+ 
+     emit(

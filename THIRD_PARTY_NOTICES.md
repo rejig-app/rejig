@@ -23,6 +23,14 @@ dependencies from their publishers; each comes under its own license.
   jsonschema-specifications, PyJWT, referencing, rpds-py and truststore (MIT); httpcore2,
   httpx2 and sse-starlette (BSD-3-Clause); python-multipart (Apache-2.0).
 
+## Methods from other projects
+
+`patches/pinned-gaps.patch` follows the gap method of
+[homescreen-mcp](https://github.com/kats1123/homescreen-mcp) by Jonathan Kats (MIT,
+Copyright (c) 2026 Jonathan Kats): page ids plus `listMetadata` `fixedLocations` in the
+layout write. `patches/widget-ids.patch` follows its fix for configured widgets: the
+element id goes back as `uniqueIdentifier`. No homescreen-mcp code is copied.
+
 ## Modified upstream code
 
 `patches/wifi-reconnect.patch` modifies `ios_homescreen/device.py`,
@@ -30,7 +38,14 @@ dependencies from their publishers; each comes under its own license.
 `ios_homescreen/ui/errors.py`, and `patches/offloaded-apps.patch` modifies
 `ios_homescreen/device.py`, `planner.py` and `report.py`, and
 `patches/mcp-companion.patch` modifies `ios_homescreen/api.py`, `ui/session.py`,
-`ui/app.py` and `ui/static/js/actions.js`. Each contains lines from those files. The installer applies
+`ui/app.py` and `ui/static/js/actions.js`, and `patches/gaps-notice.patch` modifies
+`ui/static/js/dialogs.js`, and `patches/pinned-gaps.patch` modifies `ios_homescreen/state.py`,
+`planner.py`, `model.py` and `workflow.py`, and `patches/widget-ids.patch` modifies
+`ios_homescreen/state.py`, and `patches/written-pins.patch` modifies `ios_homescreen/state.py`,
+`snapshots.py`, `api.py`, `workflow.py`, `model.py`, `report.py`, `ui/app.py`,
+`ui/session.py`, `ui/static/app.css` and `ui/static/js/actions.js`, `dialogs.js`,
+`drag.js`, `layout.js`, `main.js`, `messages.js`, `ops.js` and `preview.js`. Each contains lines from
+those files. The installer applies
 them to the user's own copy. ios-homescreen's license:
 
 ```text
