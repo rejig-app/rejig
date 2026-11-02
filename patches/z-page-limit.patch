@@ -1,0 +1,100 @@
+Rejig: reject layouts beyond the iPhone's 15 Home Screen pages before Apply.
+The phone's saved reads stop at 15 pages; a requested 20-page layout rolled back.
+Keep the editor and MCP draft from adding pages beyond that limit, and enforce it
+in the planner and device boundary so imported layouts cannot silently lose apps.
+Applies after the other Rejig patches to ios-homescreen at
+97649547dbc44295e451c6bf130a87404481e10c. MIT; upstream copyright
+(c) 2026 Yakup Emre Yerli (see THIRD_PARTY_NOTICES.md).
+
+--- a/ios_homescreen/state.py
++++ b/ios_homescreen/state.py
+@@ -18,6 +18,9 @@
+ 
+ PAGE_CELLS = 24
+ """An iPhone home screen page is a 6x4 grid."""
++
++MAX_PAGES = 15
++"""Maximum number of iPhone Home Screen pages (the dock is separate)."""
+ 
+ DOCK_SLOTS = 4
+ 
+@@ -625,6 +628,12 @@
+ def _check_sections(dock: Any, pages: Any, ignored: Any = None, *, for_write: bool = False) -> None:
+     if not isinstance(dock, list) or not isinstance(pages, list):
+         raise StateError("buttonBar and iconLists must be lists")
++    if len(pages) > MAX_PAGES:
++        raise StateError(
++            f"the iPhone holds at most {MAX_PAGES} Home Screen pages, got {len(pages)}. "
++            "Make room on existing pages or use folders.",
++            code="too_many_pages",
++        )
+     if len(dock) > DOCK_SLOTS:
+         raise StateError(f"the dock holds at most {DOCK_SLOTS} items, got {len(dock)}")
+     for pos, item in enumerate(dock, 1):
+--- a/ios_homescreen/planner.py
++++ b/ios_homescreen/planner.py
+@@ -26,6 +26,7 @@
+ from .state import (
+     DOCK_SLOTS,
+     PAGE_CELLS,
++    MAX_PAGES,
+     PLAN_FORMAT_VERSION,
+     PINS_KEY,
+     PLAN_META_KEY,
+@@ -533,6 +534,14 @@
+     page_tables = document.get("pages", [])
+     if not isinstance(page_tables, list):
+         raise _fail("bad_structure", "pages must be an array of tables ([[pages]])")
++    if len(page_tables) > MAX_PAGES:
++        raise _fail(
++            "too_many_pages",
++            f"the iPhone holds at most {MAX_PAGES} Home Screen pages, got {len(page_tables)}. "
++            "Make room on existing pages or use folders.",
++            count=len(page_tables),
++            capacity=MAX_PAGES,
++        )
+     pages: list[list[Any]] = []
+     page_pins: list[dict[str, Any]] = []
+     for page_no, table in enumerate(page_tables, 1):
+--- a/ios_homescreen/ui/static/js/layout.js
++++ b/ios_homescreen/ui/static/js/layout.js
+@@ -15,6 +15,7 @@
+ export const DOCK_ICON_TOP = DOCK_TOP + (DOCK_HEIGHT - ICON) / 2;
+ export const DOCK_SLOTS = 4;
+ export const PAGE_CELLS = 24;
++export const MAX_PAGES = 15;
+ 
+ export const FOLDER_COLS = 3;
+ export const FOLDER_ROWS = 3;
+--- a/ios_homescreen/ui/static/js/actions.js
++++ b/ios_homescreen/ui/static/js/actions.js
+@@ -2,7 +2,7 @@
+ 
+ import { ApiError, followJob, get, post } from "./api.js";
+ import { configureDrag } from "./drag.js";
+-import { PAGE_CELLS, pageCells } from "./layout.js";
++import { MAX_PAGES, PAGE_CELLS, pageCells } from "./layout.js";
+ import { refusalText } from "./messages.js";
+ import * as ops from "./ops.js";
+ import { getState, initState, setState } from "./store.js";
+@@ -546,6 +546,9 @@
+ 
+ export function addPage() {
+   const state = getState();
++  if (state.draft.pages.length >= MAX_PAGES) {
++    return showProblem({ code: "too_many_pages", details: { capacity: MAX_PAGES } });
++  }
+   const at = state.page + 1;
+   commit(ops.addPage(state.draft, at));
+   setState({ page: at });
+--- a/ios_homescreen/ui/static/js/messages.js
++++ b/ios_homescreen/ui/static/js/messages.js
+@@ -40,6 +40,8 @@
+   const where = issue.location || {};
+   const name = d.id ? quote(nameOf(d.id)) : "An item";
+   switch (issue.code) {
++    case "too_many_pages":
++      return `The iPhone holds at most ${d.capacity ?? 15} Home Screen pages. Make room on existing pages, use folders, or keep some apps in the App Library.`;
+     case "dock_full":
+       return `The dock holds ${d.capacity ?? 4} items. Take ${(d.count ?? 5) - (d.capacity ?? 4)} out of it.`;
+     case "page_full":

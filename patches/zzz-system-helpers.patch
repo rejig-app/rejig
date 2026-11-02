@@ -1,0 +1,146 @@
+Rejig: do not offer Astronomy's watch proxy or Continuity as App Library apps.
+On iPhone 13 Pro Max / iOS 27.2, six reads after a 22-app addition showed every
+regular app in the requested order, but dropped these two helpers, causing rollback.
+They lack SBAppTags=hidden. Classify their exact bundle ids as non-placeable, keep
+them in ignored, and refuse explicit imports instead of weakening readback checks.
+Applies after the other patches to ios-homescreen at
+97649547dbc44295e451c6bf130a87404481e10c. MIT; upstream copyright
+(c) 2026 Yakup Emre Yerli (see THIRD_PARTY_NOTICES.md).
+
+--- a/ios_homescreen/state.py
++++ b/ios_homescreen/state.py
+@@ -42,6 +42,10 @@
+ WIDGET_SHAPES = {"small": (2, 2), "medium": (4, 2), "large": (4, 4), "extraLarge": (4, 4)}
+ 
+ HOME_SCREEN_APP_TYPES = frozenset({"User", "System"})
++
++# These helpers lack SBAppTags=hidden, but setIconState drops them rather than
++# placing an icon (iPhone 13 Pro Max, iOS 27.2). Still include them in ignored.
++NON_PLACEABLE_APPS = frozenset({"com.apple.NanoUniverse.AegirProxyApp", "com.apple.sidecar"})
+ 
+ 
+ class StateError(ValueError):
+@@ -436,9 +440,9 @@
+     return kind is None or kind in HOME_SCREEN_APP_TYPES
+ 
+ 
+-def is_hidden_app(meta: Any) -> bool:
+-    """A system service iOS never shows (``SBAppTags`` contains ``hidden``)."""
+-    return isinstance(meta, Mapping) and bool(meta.get("hidden"))
++def is_hidden_app(meta: Any, ident: str | None = None) -> bool:
++    """A hidden service or a known helper that cannot have a Home Screen icon."""
++    return ident in NON_PLACEABLE_APPS or isinstance(meta, Mapping) and bool(meta.get("hidden"))
+ 
+ 
+ def normalize_for_write(item: Any) -> Any:
+@@ -598,6 +602,9 @@
+     if isinstance(item, str):
+         if not item:
+             raise StateError(f"{where}: empty item identifier")
++        if for_write and item in NON_PLACEABLE_APPS:
++            raise StateError(f"{where}: {item} is a system helper without a Home Screen icon",
++                             code="app_not_placeable")
+         return
+     if not isinstance(item, Mapping):
+         raise StateError(f"{where}: an item must be a dictionary or an identifier string")
+@@ -623,6 +630,9 @@
+     if in_folder and is_widget(item):
+         raise StateError(f"{where}: folders cannot contain widgets")
+     item_id(item)
++    if for_write and item_kind(item) == "app" and item_id(item) in NON_PLACEABLE_APPS:
++        raise StateError(f"{where}: {item_id(item)} is a system helper without a Home Screen icon",
++                         code="app_not_placeable")
+ 
+ 
+ def _check_sections(dock: Any, pages: Any, ignored: Any = None, *, for_write: bool = False) -> None:
+--- a/ios_homescreen/device.py
++++ b/ios_homescreen/device.py
+@@ -12,7 +12,7 @@
+ from typing import Any
+ 
+ from .events import EventSink, ignore
+-from .state import StateError, validate_write_payload
++from .state import StateError, is_hidden_app, validate_write_payload
+ from .transport import CLOSE_TIMEOUT, Backend, Transport, close_quietly, connect
+ 
+ READ_TIMEOUT = 30.0
+@@ -224,7 +224,7 @@
+             if meta.get("IsDemotedApp"):
+                 apps[ident]["offloaded"] = True
+             tags = meta.get("SBAppTags")
+-            if isinstance(tags, list | tuple) and "hidden" in tags:
++            if is_hidden_app(apps[ident], ident) or isinstance(tags, list | tuple) and "hidden" in tags:
+                 apps[ident]["hidden"] = True
+         return apps
+ 
+--- a/ios_homescreen/report.py
++++ b/ios_homescreen/report.py
+@@ -27,7 +27,7 @@
+     return sorted(
+         ident
+         for ident, meta in apps.items()
+-        if ident not in shown and counts_for_home_screen(meta) and not is_hidden_app(meta)
++        if ident not in shown and counts_for_home_screen(meta) and not is_hidden_app(meta, ident)
+     )
+ 
+ 
+--- a/ios_homescreen/planner.py
++++ b/ios_homescreen/planner.py
+@@ -213,7 +213,7 @@
+             name = _app_name(meta)
+             # Hidden system services are not offered by name (they share names like
+             # "Settings" with real apps); their bundle id still works.
+-            if name and not is_hidden_app(meta):
++            if name and not is_hidden_app(meta, ident):
+                 self.names[name].add(ident)
+ 
+     def _is_app_id(self, ident: str) -> bool:
+@@ -234,6 +234,10 @@
+     def app_by_id(self, ident: Any, where: Location) -> Any:
+         if not isinstance(ident, str) or not ident:
+             raise _fail("missing_id", "an app needs a non-empty id", where)
++        if is_hidden_app(self.installed.get(ident), ident):
++            name = _app_name(self.installed.get(ident)) or ident
++            raise _fail("app_not_placeable", f"{name} is a system helper without a Home Screen icon",
++                        where, id=ident)
+         if not self._is_app_id(ident):
+             raise _fail("unknown_app", f"unknown app id {ident!r}", where, id=ident)
+         return self._app_item(ident)
+@@ -243,7 +247,7 @@
+         if not ref:
+             raise _fail("missing_id", "empty app reference", where)
+         if self._is_app_id(ref):
+-            return self._app_item(ref)
++            return self.app_by_id(ref, where)
+         matches = {i for i in self.names.get(ref, set()) if self._is_app_id(i)}
+         if not matches and ref in self.raw:
+             kind = item_kind(self.raw[ref])
+@@ -265,7 +269,7 @@
+                 name=ref,
+                 candidates=listed,
+             )
+-        return self._app_item(next(iter(matches)))
++        return self.app_by_id(next(iter(matches)), where)
+ 
+     def existing(self, ident: Any, kind: str, where: Location) -> Any:
+         if not isinstance(ident, str) or not ident:
+--- a/ios_homescreen/ui/session.py
++++ b/ios_homescreen/ui/session.py
+@@ -542,7 +542,7 @@
+         have = self.icons.ids()
+         state = self.read["state"]
+         apps = self.read.get("apps", {}) or {}
+-        visible = sorted(ident for ident, meta in apps.items() if not is_hidden_app(meta))
++        visible = sorted(ident for ident, meta in apps.items() if not is_hidden_app(meta, ident))
+         owners = [
+             widget["app"]
+             for item in _view_items(self.view or {})
+@@ -843,7 +843,7 @@
+                             "type": str(meta.get("type", "")),
+                         }
+                         for ident, meta in apps.items()
+-                        if isinstance(meta, Mapping) and not is_hidden_app(meta)
++                        if isinstance(meta, Mapping) and not is_hidden_app(meta, ident)
+                     ),
+                     key=lambda app: (app["name"].casefold(), app["id"]),
+                 ),

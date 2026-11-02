@@ -1,0 +1,94 @@
+Rejig: preserve the requested layout and failed reads before automatic rollback,
+and describe missing/unexpected apps in the progress log. Diagnostic failure must
+never block rollback. Applies after the other patches to ios-homescreen at
+97649547dbc44295e451c6bf130a87404481e10c. MIT; upstream copyright
+(c) 2026 Yakup Emre Yerli (see THIRD_PARTY_NOTICES.md).
+
+--- a/ios_homescreen/workflow.py
++++ b/ios_homescreen/workflow.py
+@@ -21,6 +21,7 @@
+     save_plist,
+     to_payload,
+     wire_payload,
++    visible_apps,
+ )
+ 
+ APPLIED = "applied"
+@@ -87,7 +88,10 @@
+         raise WorkflowError(f"{what} did not finish within {seconds:g} s", code="timeout") from exc
+ 
+ 
+-async def _verify(device: HomeScreen, target: Any, timing: Timing) -> Any:
++async def _verify(
++    device: HomeScreen, target: Any, timing: Timing,
++    observations: list[dict[str, Any]] | None = None,
++) -> Any:
+     """The read that shows ``target`` (Rejig: so pins bind to it), or ``None``."""
+     attempts = max(1, timing.verify_attempts)
+     for attempt in range(attempts):
+@@ -95,13 +99,36 @@
+             await asyncio.sleep(timing.verify_interval)
+         try:
+             current = await _timed(device.read_state(), timing.read_timeout, "Re-read")
+-        except Exception:
++        except Exception as exc:
++            if observations is not None:
++                observations.append({"error": str(exc)})
+             # After a write, a failed read proves nothing either way. Keep trying;
+             # without proof the caller rolls back.
+             continue
++        if observations is not None:
++            observations.append({"state": current})
+         if same_layout(current, target):
+             return current
+     return None
++
++
++def _readback_difference(target: Any, observations: list[dict[str, Any]], installed: Mapping[str, Any]) -> str:
++    reads = [entry["state"] for entry in observations if "state" in entry]
++    if not reads:
++        return "The phone could not be read after the write."
++    wanted, actual = visible_apps(target), visible_apps(reads[-1])
++
++    def names(ids: set[str]) -> str:
++        ordered = sorted(ids)
++        labels = [str((installed.get(i) or {}).get("name") or i) for i in ordered[:8]]
++        return ", ".join(labels) + (f" and {len(ordered) - 8} more" if len(ordered) > 8 else "")
++
++    differences = []
++    if wanted - actual:
++        differences.append("Missing from the Home Screen: " + names(wanted - actual) + ".")
++    if actual - wanted:
++        differences.append("Unexpected on the Home Screen: " + names(actual - wanted) + ".")
++    return " ".join(differences) or "App order, pages, folders or widget configuration differed from the requested layout."
+ 
+ 
+ async def _write(device: HomeScreen, payload: dict[str, Any], seconds: float) -> bool:
+@@ -185,7 +212,8 @@
+         )
+ 
+     emit("verifying", "Re-reading the layout to verify it...", 4)
+-    verified = await _verify(device, payload, timing)
++    observations: list[dict[str, Any]] = []
++    verified = await _verify(device, payload, timing, observations)
+     if verified is not None:
+         emit("verified", "Layout verified.", 5)
+         if payload.get(PINS_KEY):
+@@ -204,6 +232,17 @@
+             pin_record(verified, payload.get(PINS_KEY)),
+         )
+ 
++    # Keep the failed reads before rollback replaces the evidence with the old layout.
++    diagnostic = Path(backup_dir) / "diagnostics" / f"readback-{backup.stem}.plist"
++    difference = _readback_difference(payload, observations, installed)
++    emit("readback_mismatch", difference, level=WARNING)
++    try:
++        save_plist(diagnostic, {"target": payload, "reads": observations, "backup": str(backup)})
++        emit("readback_saved", f"Readback details: {diagnostic}", path=diagnostic)
++    except Exception as exc:
++        # Diagnostics must never prevent recovery of the person's layout.
++        emit("readback_save_failed", f"Could not save readback details: {exc}", level=WARNING)
++
+     emit(
+         "rolling_back",
+         "The new layout could not be verified. Rolling back to the backup...",

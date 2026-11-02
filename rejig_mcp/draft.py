@@ -21,6 +21,7 @@ from typing import Any
 FOLDER_SLOTS = 9
 FOLDABLE = frozenset({"app", "webclip", "webapp"})
 PAGE_CELLS = 24  # 6 rows of 4
+MAX_PAGES = 15
 NAME_LIMIT = 40
 
 
@@ -154,6 +155,7 @@ def _put(layout: dict[str, Any], item: dict[str, Any], to: Any) -> None:
     elif section == "page":
         page = _page_number(layout, to.get("page", len(layout["pages"])), extra=1)
         if page == len(layout["pages"]):
+            _check_new_page(layout)
             layout["pages"].append([])
         _insert(layout["pages"][page], to.get("index"), item)
     elif section == "folder":
@@ -167,6 +169,15 @@ def _put(layout: dict[str, Any], item: dict[str, Any], to: Any) -> None:
         folder["pages"] = [inside]
     else:
         raise DraftError("bad_operation", "section is dock, page or folder.")
+
+
+def _check_new_page(layout: Mapping[str, Any]) -> None:
+    if len(layout["pages"]) >= MAX_PAGES:
+        raise DraftError(
+            "too_many_pages",
+            f"The iPhone holds at most {MAX_PAGES} Home Screen pages. "
+            "Make room on existing pages, use folders, or keep some apps in the App Library.",
+        )
 
 
 def _tidy(layout: dict[str, Any]) -> None:
@@ -231,6 +242,7 @@ def _operation(layout: dict[str, Any], op: Mapping[str, Any], apps: Mapping[str,
         items, index = _locate(layout, folder["id"])
         items[index : index + 1] = [x for page in folder["pages"] for x in page]
     elif kind == "page_add":
+        _check_new_page(layout)
         at = op.get("at", len(layout["pages"]) + 1)
         layout["pages"].insert(_page_number(layout, at, extra=1), [])
     elif kind == "page_remove":

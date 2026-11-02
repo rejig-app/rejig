@@ -254,7 +254,7 @@ supported.
 
 ## Limits
 
-- The installer applies eight patches to the engine. `patches/wifi-reconnect.patch`: a
+- The installer applies eleven patches to the engine. `patches/wifi-reconnect.patch`: a
   layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
   only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
   is the one the backup or layout came from before writing.
@@ -271,7 +271,17 @@ supported.
   small Weather widget kept its location through three applies, though iOS reads it back
   under the setting's alias without echoing the `uniqueIdentifier` field. `patches/written-pins.patch`: the editor places an app on an
   empty cell, Rejig remembers the gaps it placed for each iPhone, and every Apply, rollback
-  and Restore sends them back.
+  and Restore sends them back. `patches/z-page-limit.patch`: the editor and planner reject
+  layouts beyond the iPhone's 15 Home Screen pages before writing.
+  `patches/zz-readback-details.patch`: failed verification names missing or unexpected
+  apps and saves the target and attempted reads under the backup folder's `diagnostics/`
+  directory before rollback, so the cause can be inspected afterwards.
+  `patches/zzz-system-helpers.patch`: excludes Astronomy’s watch proxy and Continuity
+  from the App Library list and rejects attempts to place them. The phone silently
+  drops these system helpers from a write, even though its app list does not mark them hidden.
+- An iPhone holds at most 15 Home Screen pages, with 24 cells per page. At that limit,
+  make room on existing pages, put apps in folders, or keep some in the App Library.
+  Adding more pages in Rejig cannot increase the phone's limit.
 - The MCP server arranges the layout only. It does not uninstall apps, create widgets or
   read Screen Time; give it usage numbers yourself if you want it to sort by them.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.
