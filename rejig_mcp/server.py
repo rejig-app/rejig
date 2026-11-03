@@ -42,6 +42,7 @@ from ios_homescreen.report import app_places, change_summary
 from ios_homescreen.snapshots import device_of, load_pull
 from ios_homescreen.state import fingerprint, same_layout
 from ios_homescreen.storage import PULLS, find_backup
+from ios_homescreen.workflow import _widget_reflow_only
 
 from . import draft as drafting
 from .draft import DraftError, Drafts
@@ -409,7 +410,10 @@ def reads_as_target(plan: dict[str, Any], state: dict[str, Any], read: dict[str,
     if read["view"].get("fingerprint") == plan["target_fingerprint"]:
         return True
     written = planned_write(plan, state)
-    return written is not None and same_layout(written, pulled_state(state, read["file"]))
+    if written is None:
+        return False
+    actual = pulled_state(state, read["file"])
+    return same_layout(written, actual) or _widget_reflow_only(actual, written)
 
 
 def leaves_order(plan: dict[str, Any], state: dict[str, Any]) -> bool | None:

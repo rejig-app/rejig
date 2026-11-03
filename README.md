@@ -254,7 +254,7 @@ supported.
 
 ## Limits
 
-- The installer applies eight patches to the engine. `patches/wifi-reconnect.patch`: a
+- The installer applies nine patches to the engine. `patches/wifi-reconnect.patch`: a
   layout write can close the Wi-Fi tunnel, and the patch reopens it for the same phone
   only. `patches/device-identity.patch`: Restore and Apply check that the connected phone
   is the one the backup or layout came from before writing.
@@ -271,7 +271,9 @@ supported.
   small Weather widget kept its location through three applies, though iOS reads it back
   under the setting's alias without echoing the `uniqueIdentifier` field. `patches/written-pins.patch`: the editor places an app on an
   empty cell, Rejig remembers the gaps it placed for each iPhone, and every Apply, rollback
-  and Restore sends them back.
+  and Restore sends them back. `patches/zz-widget-reflow-verify.patch`: on a crowded page iOS
+  may move a widget to keep the grid gapless, so the readback check accepts widgets in a
+  different place on the same page while apps and folders still have to match exactly.
 - The MCP server arranges the layout only. It does not uninstall apps, create widgets or
   read Screen Time; give it usage numbers yourself if you want it to sort by them.
 - Rejig moves existing widgets and stacks; it cannot create new widgets.

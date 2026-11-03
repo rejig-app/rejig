@@ -1,0 +1,56 @@
+--- a/ios_homescreen/workflow.py	2026-11-03 13:51:02
++++ b/ios_homescreen/workflow.py	2026-11-03 13:51:02
+@@ -13,6 +13,7 @@
+ from .state import (
+     PINS_KEY,
+     PLAN_META_KEY,
++    canonical,
+     fingerprint,
+     pin_record,
+     reconcile_pins,
+@@ -99,9 +100,44 @@
+             # After a write, a failed read proves nothing either way. Keep trying;
+             # without proof the caller rolls back.
+             continue
+-        if same_layout(current, target):
++        if same_layout(current, target) or _widget_reflow_only(current, target):
+             return current
+     return None
++
++
++def _widget_reflow_only(current: Any, target: Any) -> bool:
++    """Rejig: iOS may pack a widget elsewhere on the same page to avoid a gap.
++
++    Apps, folders and page order must still match exactly; widgets may change place
++    among themselves as long as every planned widget is still on that page.
++    """
++    try:
++        left = canonical(current, readback=True)
++        right = canonical(target, readback=True)
++    except Exception:
++        return False
++    if left[0] != right[0] or len(left[1]) != len(right[1]):
++        return False
++    for page_read, page_plan in zip(left[1], right[1]):
++        if page_read == page_plan:
++            continue
++        if len(page_read) != len(page_plan):
++            return False
++        if [x for x in page_read if x[0] != "widget"] != [
++            x for x in page_plan if x[0] != "widget"
++        ]:
++            return False
++        unmatched = [x for x in page_read if x[0] == "widget"]
++        for wanted in (x for x in page_plan if x[0] == "widget"):
++            for index, candidate in enumerate(unmatched):
++                if candidate == wanted:
++                    unmatched.pop(index)
++                    break
++            else:
++                return False
++        if unmatched:
++            return False
++    return True
+ 
+ 
+ async def _write(device: HomeScreen, payload: dict[str, Any], seconds: float) -> bool:
